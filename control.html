@@ -1,0 +1,103 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Presence color control</title><style>
+*{box-sizing:border-box}body{margin:0;background:#111614;color:#edf3ed;font:16px system-ui,sans-serif;padding:clamp(20px,5vw,64px)}main{max-width:1100px;margin:auto}h1{font-size:clamp(28px,4vw,42px);letter-spacing:-.04em;font-weight:550;margin:8px 0 20px}.eyebrow{color:#b6ceab;font-size:12px;letter-spacing:.14em}p{line-height:1.6}.muted{color:#aebcb2}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:28px 0}.card,.output{background:#1b251f;border:1px solid #3b5042;border-radius:16px;padding:22px}.card.active{border-color:#c5f387;box-shadow:0 0 0 2px #c5f387}h2{margin:0 0 8px}code{font-size:13px;overflow-wrap:anywhere}.swatch{height:90px;border-radius:10px;margin:20px 0}input[type=color]{width:100%;height:48px;border:0;background:none;cursor:pointer}label{display:block;margin:16px 0 5px;font-size:14px}input[type=range]{width:100%;accent-color:#c5f387}input[type=text]{width:100%;padding:10px;background:#111614;color:#edf3ed;border:1px solid #526956;border-radius:6px;font:inherit}button{padding:11px 18px;background:#c5f387;color:#14220e;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer;margin-top:18px}button:disabled{opacity:.4;cursor:default}:focus-visible{outline:3px solid white;outline-offset:3px}.output{display:flex;align-items:center;gap:20px}.ball{width:72px;height:72px;border-radius:50%;background:#36453a;flex-shrink:0}.log{white-space:pre-wrap;font:13px ui-monospace,monospace;color:#aebcb2;max-height:200px;overflow:auto}a{color:#c5f387}@media(max-width:760px){.grid{grid-template-columns:1fr}}</style></head><body><main>
+<p class="eyebrow">NABA · TEST 01 · MQTT</p><h1>Presence → color</h1><p id="connection" role="status">Connecting…</p><p class="muted">Choose a color for each circle. Every incoming <strong>1</strong> sends that circle’s color to <code>naba/test01/ball</code>. A <strong>0</strong> updates presence without sending a color. If several circles trigger, the latest message wins.</p><div class="grid" id="controls"></div>
+<div class="output"><div class="ball" id="ball"></div><div><strong>Output · <code>naba/test01/ball</code></strong><p id="last" role="status">No color sent yet.</p></div></div><p class="muted">Payload format: <code>#RRGGBB</code> (for example <code>#FF0000</code>). QoS 0, not retained. Colors are saved in this browser. Keep this page open to route messages.</p><p class="muted">Broker: <code>wss://mqtt.marcobrianza.it:8084/mqtt</code> · <a href="webcam.html" target="_blank" rel="noopener">Open webcam viewer ↗</a></p><pre class="log" id="log" aria-label="Recent MQTT events"></pre>
+<script>class PresenceMQTT {
+  constructor(url, topics, report) {
+    this.url=url; this.topics=topics; this.report=report;
+    this.values=topics.map(()=>0); this.sent=topics.map(()=>null);
+    this.encoder=new TextEncoder(); this.enabled=false; this.ready=false;
+  }
+  text(value) { const b=this.encoder.encode(value); return [b.length>>8,b.length&255,...b]; }
+  send(header, body=[]) {
+    if(this.ws?.readyState!==1) return false;
+    let n=body.length, length=[];
+    do { const d=n%128; n=Math.floor(n/128); length.push(d|(n?128:0)); } while(n);
+    try { this.ws.send(new Uint8Array([header,...length,...body])); return true; }
+    catch { this.ws.close(); return false; }
+  }
+  update(values) { this.values=values.map(v=>v?1:0); this.flush(); }
+  flush() {
+    if(!this.ready)return;
+    this.values.forEach((value,i)=>{
+      if(this.sent[i]===value)return;
+      // QoS 0, not retained: don't leave a stale presence value on the broker.
+      if(this.send(0x30,[...this.text(this.topics[i]),...this.encoder.encode(String(value))])) {
+        this.sent[i]=value;
+        this.report('sent',this.topics[i]+' → '+value);
+      }
+    });
+  }
+  connect() {
+    this.enabled=true; clearTimeout(this.retry);
+    if(this.ws&&this.ws.readyState<2)return;
+    this.ready=false; this.sent=this.topics.map(()=>null); this.buffer=new Uint8Array();
+    this.report('status','Connecting…');
+    let socket;
+    try { socket=new WebSocket(this.url,'mqtt'); } catch { this.scheduleRetry(); return; }
+    this.ws=socket; socket.binaryType='arraybuffer';
+    const timeout=setTimeout(()=>socket.close(),10000);
+    socket.onopen=()=>{
+      if(this.ws!==socket)return;
+      const id='webcam-'+crypto.getRandomValues(new Uint32Array(2)).join('-');
+      this.send(0x10,[...this.text('MQTT'),4,2,0,30,...this.text(id)]);
+      this.lastReceived=Date.now();
+      this.ping=setInterval(()=>{
+        if(Date.now()-this.lastReceived>45000)socket.close();
+        else this.send(0xc0);
+      },15000);
+    };
+    socket.onmessage=event=>{
+      if(this.ws!==socket)return;
+      this.lastReceived=Date.now();
+      const incoming=new Uint8Array(event.data), merged=new Uint8Array(this.buffer.length+incoming.length);
+      merged.set(this.buffer); merged.set(incoming,this.buffer.length); this.buffer=merged;
+      while(this.buffer.length>=2) {
+        let n=0,m=1,i=1,d;
+        do {
+          if(i>=this.buffer.length)return;
+          d=this.buffer[i++]; n+=(d&127)*m; m*=128;
+          if(i>5){socket.close();return;}
+        } while(d&128);
+        if(n>1048576){socket.close();return;}
+        if(this.buffer.length<i+n)return;
+        const type=this.buffer[0]>>4, body=this.buffer.slice(i,i+n);
+        this.buffer=this.buffer.slice(i+n);
+        if(type===9) { if(body.length!==5||body.slice(2).some(code=>code===128)){socket.close();return;} this.ready=true; this.report('status','Connected · listening to A, B, C'); }
+        if(type===3 && body.length>=2) { const size=(body[0]<<8)|body[1]; if(size+2<=body.length){const topic=new TextDecoder().decode(body.slice(2,2+size));const payload=new TextDecoder().decode(body.slice(2+size)); this.report('message',{topic,payload});} }
+        if(type===2) {
+          clearTimeout(timeout);
+          if(body.length!==2||body[1]!==0){this.report('status','Broker refused connection');socket.close();return;}
+          this.send(0x82,[0,1,...this.topics.flatMap(topic=>[...this.text(topic),0])]);
+        }
+      }
+    };
+    socket.onerror=()=>this.report('status','Connection error: check network or broker');
+    socket.onclose=()=>{
+      clearTimeout(timeout);
+      if(this.ws!==socket)return;
+      clearInterval(this.ping); this.ready=false; this.ws=null;
+      if(this.enabled)this.scheduleRetry();
+    };
+  }
+  scheduleRetry() {
+    this.report('status','Disconnected · retrying in 3 seconds');
+    clearTimeout(this.retry); this.retry=setTimeout(()=>this.connect(),3000);
+  }
+  close() {
+    this.enabled=false; clearTimeout(this.retry); clearInterval(this.ping);
+    this.send(0xe0); this.ws?.close(); this.ready=false;
+  }
+}
+const topics=['naba/test01/a','naba/test01/b','naba/test01/c'];
+const defaults=['#FF4040','#45DB8C','#599CFF'];
+let saved;try{saved=JSON.parse(localStorage.getItem('naba-test01-colors'));}catch{}
+const colors=defaults.map((v,i)=>/^#[0-9a-f]{6}$/i.test(saved?.[i])?saved[i].toUpperCase():v);
+const cards=[];
+function log(message){const el=document.getElementById('log');el.textContent=(new Date().toLocaleTimeString()+' · '+message+'\n'+el.textContent).split('\n').slice(0,18).join('\n');}
+function setColor(i,value){if(!/^#[0-9a-f]{6}$/i.test(value))return;colors[i]=value.toUpperCase();const card=cards[i];card.querySelector('.swatch').style.background=colors[i];card.querySelector('[type=color]').value=colors[i];card.querySelector('[type=text]').value=colors[i];['r','g','b'].forEach((channel,j)=>{const v=parseInt(colors[i].slice(1+j*2,3+j*2),16);card.querySelector('[data-channel='+channel+']').value=v;card.querySelector('[data-value='+channel+']').textContent=v;});try{localStorage.setItem('naba-test01-colors',JSON.stringify(colors));}catch{}}
+function publishColor(i){if(!mqtt.ready){log('Not connected · color was not sent');return;}const color=colors[i];if(mqtt.send(0x30,[...mqtt.text('naba/test01/ball'),...mqtt.encoder.encode(color)])){document.getElementById('ball').style.background=color;document.getElementById('last').textContent=colors[i]+' · from '+['A','B','C'][i]+' · '+new Date().toLocaleTimeString();log('OUT naba/test01/ball → '+color);}}
+topics.forEach((topic,i)=>{const card=document.createElement('section');card.className='card';card.innerHTML='<h2>Circle '+['A','B','C'][i]+'</h2><code>'+topic+'</code><p class="muted" data-presence>Waiting for presence</p><div class="swatch"></div><label for="color'+i+'">Choose color</label><input type="color" id="color'+i+'"><label for="hex'+i+'">Hex color</label><input type="text" id="hex'+i+'" maxlength="7" pattern="#[0-9A-Fa-f]{6}" spellcheck="false">'+['r','g','b'].map(channel=>'<label for="'+channel+i+'">'+{r:'Red',g:'Green',b:'Blue'}[channel]+' · <span data-value="'+channel+'"></span></label><input id="'+channel+i+'" data-channel="'+channel+'" type="range" min="0" max="255">').join('')+'<button type="button" disabled>Send '+['A','B','C'][i]+' color</button>';document.getElementById('controls').append(card);cards.push(card);setColor(i,colors[i]);card.querySelector('[type=color]').addEventListener('input',e=>setColor(i,e.target.value));card.querySelector('[type=text]').addEventListener('change',e=>{if(/^#[0-9a-f]{6}$/i.test(e.target.value))setColor(i,e.target.value);else{e.target.value=colors[i];log('Use a hex color such as #FF0000');}});card.querySelectorAll('[type=range]').forEach(slider=>slider.addEventListener('input',()=>setColor(i,'#'+Array.from(card.querySelectorAll('[type=range]')).map(s=>Number(s.value).toString(16).padStart(2,'0')).join(''))));card.querySelector('button').addEventListener('click',()=>publishColor(i));});
+const mqtt=new PresenceMQTT('wss://mqtt.marcobrianza.it:8084/mqtt',topics,(kind,message)=>{if(kind==='status'){document.getElementById('connection').textContent='MQTT: '+message;cards.forEach(card=>card.querySelector('button').disabled=!mqtt.ready);log(message);}else if(kind==='message'){const i=topics.indexOf(message.topic);if(i<0)return;const value=message.payload.trim();if(value!=='0'&&value!=='1'){log('Ignored invalid presence payload on '+message.topic);return;}cards[i].classList.toggle('active',value==='1');cards[i].querySelector('[data-presence]').textContent=value==='1'?'● Presence detected':'○ No presence';log('IN '+message.topic+' → '+value);if(value==='1')publishColor(i);}});
+mqtt.connect();window.addEventListener('pagehide',()=>mqtt.close());window.addEventListener('pageshow',()=>{if(!mqtt.enabled)mqtt.connect();});
+</script></main></body></html>
