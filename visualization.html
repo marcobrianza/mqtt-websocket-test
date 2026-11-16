@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Palline RGY · MQTT</title>
+<!-- client MQTT per browser (MQTT su WebSocket) -->
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+/* Layout: canvas a tutto schermo, una sola riga di stato in alto */
+:root {
+  --bg: #eef0f3;
+  --fg: #1d2129;
+  --muted: #6b7380;
+  --panel: rgba(255,255,255,.84);
+  --line: #d3d8df;
+  --ok: #2bb673;
+  --err: #e5383b;
+  --font: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#13161b; --fg:#e8ebf0; --muted:#8a93a1; --panel:rgba(28,32,39,.86); --line:#2c323c; color-scheme: dark; }
+}
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font); overflow: hidden;
+  -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; outline: none; touch-action: none; }
+.hud {
+  position: fixed; top: 0; left: 0; right: 0; pointer-events: none;
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 0 max(16px, env(safe-area-inset-left, 0px));
+}
+.pill { background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(6px); border-radius: 999px;
+  padding: 4px 10px; font: 12px var(--mono); display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.pill i { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.mq.on i { background: var(--ok); }
+.mq.err i { background: var(--err); }
+.right { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.flash { animation: flash .4s ease-out; }
+@keyframes flash { from { background: var(--fg); color: var(--bg); } }
+@media (prefers-reduced-motion: reduce) { .flash { animation: none; } }
+</style>
+</head>
+<body>
+
+<canvas id="stage" tabindex="0" aria-label="Area delle palline"></canvas>
+
+<div class="hud">
+  <div class="pill" id="count" aria-live="polite"><i id="lastDot"></i><b id="total">0</b>&nbsp;palline</div>
+  <div class="right">
+    <div class="pill mq" id="mq"><i></i><span id="mqText">MQTT: connessione…</span></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('stage');
+  const ctx = cv.getContext('2d');
+  const MAX = 300;
+  const SUB = 4;                 // sotto-passi per frame: collisioni più stabili
+  const R_MIN = 10, R_MAX = 38;  // massa = raggio²: la più grande pesa ~14 volte la più piccola
+  const KEY_COLORS = { r: 'rgb(229,56,59)', g: 'rgb(43,182,115)', y: 'rgb(245,197,24)' };
+
+  let W = 0, H = 0, dpr = 1;
+  let balls = [];
+
+  // ---- sfondi (tasto B) ----
+  const BGS = [null, '#0f1a2b', '#f6efe2', '#1e3d2f', '#2a1633', '#ffffff', '#111111'];
+  let bgIdx = 0;
+  const bgColor = () => BGS[bgIdx] || getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+
+  // ---- schermo intero (tasto F) ----
+  function toggleFs() {
+    const el = document.documentElement;
+    const inFs = document.fullscreenElement || document.webkitFullscreenElement;
+    try {
+      const p = inFs ? (document.exitFullscreen || document.webkitExitFullscreen).call(document)
+                     : (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
+  document.addEventListener('fullscreenchange', () => setTimeout(resize, 50));
+  document.addEventListener('webkitfullscreenchange', () => setTimeout(resize, 50));
+
+  // ---- fisica ----
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = cv.clientWidth; H = cv.clientHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    for (const b of balls) {
+      b.x = Math.min(Math.max(b.x, b.r), W - b.r);
+      b.y = Math.min(Math.max(b.y, b.r), H - b.r);
+    }
+  }
+
+  function spawn(color) {
+    if (balls.length >= MAX) return;
+    const r = R_MIN + Math.random() * (R_MAX - R_MIN);
+    let x, y, ok = false;
+    for (let t = 0; t < 40 && !ok; t++) {
+      x = r + Math.random() * (W - 2 * r);
+      y = r + Math.random() * (H - 2 * r);
+      ok = balls.every(b => (b.x - x) ** 2 + (b.y - y) ** 2 > (b.r + r) ** 2);
+    }
+    const ang = Math.random() * Math.PI * 2;
+    const speed = 120 + Math.random() * 180;
+    balls.push({ x, y, r, vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed, m: r * r, color });
+    document.getElementById('lastDot').style.background = color;
+    updateHud();
+  }
+
+  function reset() { balls = []; updateHud(); }
+  function updateHud() { document.getElementById('total').textContent = balls.length; }
+
+  function step(dt) {
+    for (const b of balls) {
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx); }
+      else if (b.x > W - b.r) { b.x = W - b.r; b.vx = -Math.abs(b.vx); }
+      if (b.y < b.r) { b.y = b.r; b.vy = Math.abs(b.vy); }
+      else if (b.y > H - b.r) { b.y = H - b.r; b.vy = -Math.abs(b.vy); }
+    }
+    for (let i = 0; i < balls.length; i++) {
+      const a = balls[i];
+      for (let j = i + 1; j < balls.length; j++) {
+        const b = balls[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const minD = a.r + b.r;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= minD * minD || d2 === 0) continue;
+        const d = Math.sqrt(d2);
+        const nx = dx / d, ny = dy / d;
+        const overlap = minD - d;
+        const tot = a.m + b.m;
+        a.x -= nx * overlap * (b.m / tot); a.y -= ny * overlap * (b.m / tot);
+        b.x += nx * overlap * (a.m / tot); b.y += ny * overlap * (a.m / tot);
+        const rel = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+        if (rel <= 0) continue;
+        const jImp = (2 * rel) / tot; // urto perfettamente elastico
+        a.vx -= jImp * b.m * nx; a.vy -= jImp * b.m * ny;
+        b.vx += jImp * a.m * nx; b.vy += jImp * a.m * ny;
+      }
+    }
+  }
+
+  function draw() {
+    ctx.fillStyle = bgColor();
+    ctx.fillRect(0, 0, W, H);
+    for (const b of balls) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fillStyle = b.color;
+      ctx.fill();
+    }
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    let dt = (now - last) / 1000; last = now;
+    if (dt > 0.033) dt = 0.033;
+    for (let s = 0; s < SUB; s++) step(dt / SUB);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ---- tastiera (comandi di servizio, senza pulsanti a schermo) ----
+  window.addEventListener('keydown', e => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.code === 'Space' ? ' ' : e.key.toLowerCase();
+    if (KEY_COLORS[k]) spawn(KEY_COLORS[k]);
+    else if (k === ' ') reset();
+    else if (k === 'b') bgIdx = (bgIdx + 1) % BGS.length;
+    else if (k === 'f') toggleFs();
+    else return;
+    e.preventDefault();
+  });
+
+  window.addEventListener('resize', resize);
+  resize();
+  cv.focus();
+  requestAnimationFrame(loop);
+
+  // ---- MQTT ----
+  // Topic ascoltati (sotto BASE, default naba/test01):
+  //   ball     → payload "R G B" (es. "127 64 0"): pallina di quel colore
+  //   reset     → qualsiasi payload tranne "0": cancella tutte le palline
+  // Broker e topic si cambiano dall'indirizzo: ?broker=wss://...&topic=naba/test02
+  const params = new URLSearchParams(location.search);
+  const BROKER = params.get('broker') || 'wss://mqtt.marcobrianza.it:8084/mqtt';
+  const BASE = (params.get('topic') || 'naba/test01').replace(/\/+$/, '');
+
+  const mqEl = document.getElementById('mq');
+  const mqText = document.getElementById('mqText');
+  const setStatus = (cls, txt) => { mqEl.className = 'pill mq ' + cls; mqText.textContent = txt; };
+  const flash = el => { el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); };
+
+  // "127 64 0" → "rgb(127,64,0)"; accetta anche virgole.
+  // "#7f4000" o "#f80" (esadecimale, maiuscole o minuscole) → stesso formato.
+  // Restituisce null se non valido.
+  function parseRGB(txt) {
+    if (txt.startsWith('#')) {
+      let h = txt.slice(1);
+      if (!/^([0-9a-f]{3}|[0-9a-f]{6})$/i.test(h)) return null;
+      if (h.length === 3) h = h.split('').map(ch => ch + ch).join('');
+      const v = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+      return `rgb(${v[0]},${v[1]},${v[2]})`;
+    }
+    const parts = txt.split(/[\s,]+/).filter(Boolean);
+    if (parts.length !== 3) return null;
+    const n = parts.map(Number);
+    if (n.some(v => !Number.isFinite(v))) return null;
+    const c = n.map(v => Math.max(0, Math.min(255, Math.round(v))));
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  }
+
+  function onMessage(topic, payload) {
+    if (!topic.startsWith(BASE + '/')) return;
+    const key = topic.slice(BASE.length + 1);
+    const txt = (typeof payload === 'string' ? payload : new TextDecoder().decode(payload)).trim();
+
+    if (key === 'ball') {
+      const color = parseRGB(txt);
+      if (!color) { setStatus('err', 'MQTT: colore non valido "' + txt.slice(0, 20) + '"'); return; }
+      spawn(color);
+    } else if (key === 'reset') {
+      if (txt === '0') return;
+      reset();
+    } else return; // a, b, c della webcam e qualsiasi altro topic: ignorati
+    setStatus('on', 'MQTT: ' + BASE); // un messaggio valido cancella un eventuale avviso precedente
+    flash(document.getElementById('count'));
+  }
+  window.__onMessage = onMessage; // utile per provare dalla console del browser
+
+  if (typeof mqtt === 'undefined') {
+    setStatus('err', 'MQTT: libreria non caricata');
+  } else {
+    const client = mqtt.connect(BROKER, {
+      clientId: 'palline_' + Math.random().toString(16).slice(2, 10),
+      clean: true, reconnectPeriod: 2000, connectTimeout: 8000
+    });
+    client.on('connect', () => { setStatus('on', 'MQTT: ' + BASE); client.subscribe([BASE + '/ball', BASE + '/reset'], { qos: 0 }); });
+    client.on('reconnect', () => setStatus('', 'MQTT: riconnessione…'));
+    client.on('offline', () => setStatus('err', 'MQTT: offline'));
+    client.on('error', () => setStatus('err', 'MQTT: errore di connessione'));
+    client.on('message', onMessage);
+  }
+})();
+</script>
+</body>
+</html>
