@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Adaptive reference circles</title>
+<meta name="description" content="A simple, private live preview of your webcam.">
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111614;color:#edf3ed;font:16px system-ui,sans-serif;min-height:100svh;padding:clamp(20px,5vw,64px)}main{max-width:1100px;margin:auto}header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px}h1{font-size:clamp(25px,4vw,38px);font-weight:550;letter-spacing:-.04em;margin:0}.label{color:#aebcb2;font-size:13px;margin:0 0 8px;letter-spacing:.12em;text-transform:uppercase}.screen{position:relative;background:#080b09;border:1px solid #34433a;border-radius:16px;overflow:hidden;aspect-ratio:16/9;display:grid;place-items:center}video{width:100%;height:100%;object-fit:contain;display:block;position:absolute;inset:0}#placeholder{color:#aebcb2;padding:24px;text-align:center}.controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:22px 0 14px}button{font:inherit;font-weight:600;padding:12px 20px;border:1px solid #45574a;border-radius:9px;background:#25332a;color:#edf3ed;cursor:pointer}#start{background:#c5f387;color:#14220e;border-color:#c5f387}button:disabled{opacity:.45;cursor:default}button:focus-visible{outline:3px solid #fff;outline-offset:4px}#status{color:#c2cdc5;margin:0;line-height:1.5}.note{color:#8e9f93;font-size:14px;line-height:1.6}#live{font-size:13px;color:#aebcb2;white-space:nowrap}#live.active{color:#c5f387}
+#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}#placeholder{z-index:1}.tuning{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:20px 0}input[type=range]{width:min(320px,60vw);accent-color:#c5f387}#meters{font-variant-numeric:tabular-nums;color:#aebcb2;font-size:14px;line-height:1.7}
+</style>
+</head>
+<body>
+<main>
+<header><div><p class="label">Camera experiment · 05 · MQTT</p><h1>Adaptive reference circles</h1></div><span id="live">Camera off</span></header>
+<div class="screen"><video id="video" autoplay muted playsinline aria-label="Live webcam preview"></video><canvas id="overlay" aria-label="Three reference comparison circles"></canvas><div id="placeholder">Your camera preview will appear here.</div></div>
+<div class="controls"><button id="start" type="button">Start camera</button><button id="stop" type="button" disabled>Stop camera</button><button id="capture" type="button" disabled>Capture reference frame</button></div>
+<div class="tuning"><label for="threshold">Difference threshold</label><input id="threshold" type="range" min="1" max="50" value="8" step="1"><output id="thresholdValue" for="threshold">8%</output></div>
+<div class="tuning"><label for="adaptation">Reference adaptation</label><input id="adaptation" type="range" min="0" max="10" value="1" step="0.1"><output id="adaptationValue" for="adaptation">1.0% per update</output></div>
+<p class="note">At 1%, each update blends 99% of the existing reference with 1% of the current image. Lower values adapt more slowly; 0% freezes the reference. Processing runs at up to 15 updates per second.</p>
+<p id="meters">Left: 0.0% · Center: 0.0% · Right: 0.0%</p>
+<p class="note">Start the camera, then capture the initial reference. The reference slowly adapts to brightness, color, and scene changes. Each circle turns white when enough pixels differ from the current reference. Stationary objects gradually become part of the reference. Capture again to reset it immediately.</p>
+<section aria-label="MQTT connection"><p id="mqttStatus" role="status">MQTT: connecting…</p><p class="note">Broker: wss://mqtt.marcobrianza.it:8084/mqtt<br>Left → naba/test01/a · Center → naba/test01/b · Right → naba/test01/c<br>Payload: 1 = presence · 0 = no presence. Messages are sent on changes, with current states sent on connection. QoS 0 · not retained.</p><p id="mqttStates">a: 0 · b: 0 · c: 0</p><p id="mqttLast" class="note">No message sent yet.</p></section>
+<p id="status" role="status" aria-live="polite">Start the camera, then allow access when your browser asks.</p>
+<p class="note">Video stays in this page. Only the three presence values are sent to MQTT. No microphone access is requested.</p>
+</main>
+<script>
+/* MQTT 3.1.1 over WebSocket. No dependencies or camera frames leave this page. */
+class PresenceMQTT {
+  constructor(url, topics, report) {
+    this.url=url; this.topics=topics; this.report=report;
+    this.values=topics.map(()=>0); this.sent=topics.map(()=>null);
+    this.encoder=new TextEncoder(); this.enabled=false; this.ready=false;
+  }
+  text(value) { const b=this.encoder.encode(value); return [b.length>>8,b.length&255,...b]; }
+  send(header, body=[]) {
+    if(this.ws?.readyState!==1) return false;
+    let n=body.length, length=[];
+    do { const d=n%128; n=Math.floor(n/128); length.push(d|(n?128:0)); } while(n);
+    try { this.ws.send(new Uint8Array([header,...length,...body])); return true; }
+    catch { this.ws.close(); return false; }
+  }
+  update(values) { this.values=values.map(v=>v?1:0); this.flush(); }
+  flush() {
+    if(!this.ready)return;
+    this.values.forEach((value,i)=>{
+      if(this.sent[i]===value)return;
+      // QoS 0, not retained: don't leave a stale presence value on the broker.
+      if(this.send(0x30,[...this.text(this.topics[i]),...this.encoder.encode(String(value))])) {
+        this.sent[i]=value;
+        this.report('sent',this.topics[i]+' → '+value);
+      }
+    });
+  }
+  connect() {
+    this.enabled=true; clearTimeout(this.retry);
+    if(this.ws&&this.ws.readyState<2)return;
+    this.ready=false; this.sent=this.topics.map(()=>null); this.buffer=new Uint8Array();
+    this.report('status','Connecting…');
+    let socket;
+    try { socket=new WebSocket(this.url,'mqtt'); } catch { this.scheduleRetry(); return; }
+    this.ws=socket; socket.binaryType='arraybuffer';
+    const timeout=setTimeout(()=>socket.close(),10000);
+    socket.onopen=()=>{
+      if(this.ws!==socket)return;
+      const id='webcam-'+crypto.getRandomValues(new Uint32Array(2)).join('-');
+      this.send(0x10,[...this.text('MQTT'),4,2,0,30,...this.text(id)]);
+      this.lastReceived=Date.now();
+      this.ping=setInterval(()=>{
+        if(Date.now()-this.lastReceived>45000)socket.close();
+        else this.send(0xc0);
+      },15000);
+    };
+    socket.onmessage=event=>{
+      if(this.ws!==socket)return;
+      this.lastReceived=Date.now();
+      const incoming=new Uint8Array(event.data), merged=new Uint8Array(this.buffer.length+incoming.length);
+      merged.set(this.buffer); merged.set(incoming,this.buffer.length); this.buffer=merged;
+      while(this.buffer.length>=2) {
+        let n=0,m=1,i=1,d;
+        do {
+          if(i>=this.buffer.length)return;
+          d=this.buffer[i++]; n+=(d&127)*m; m*=128;
+          if(i>5){socket.close();return;}
+        } while(d&128);
+        if(n>1048576){socket.close();return;}
+        if(this.buffer.length<i+n)return;
+        const type=this.buffer[0]>>4, body=this.buffer.slice(i,i+n);
+        this.buffer=this.buffer.slice(i+n);
+        if(type===2) {
+          clearTimeout(timeout);
+          if(body.length!==2||body[1]!==0){this.report('status','Broker refused connection');socket.close();return;}
+          this.ready=true; this.report('status','Connected'); this.flush();
+        }
+      }
+    };
+    socket.onerror=()=>this.report('status','Connection error: check network or broker');
+    socket.onclose=()=>{
+      clearTimeout(timeout);
+      if(this.ws!==socket)return;
+      clearInterval(this.ping); this.ready=false; this.ws=null;
+      if(this.enabled)this.scheduleRetry();
+    };
+  }
+  scheduleRetry() {
+    this.report('status','Disconnected · retrying in 3 seconds');
+    clearTimeout(this.retry); this.retry=setTimeout(()=>this.connect(),3000);
+  }
+  close() {
+    this.update(this.topics.map(()=>0));
+    this.enabled=false; clearTimeout(this.retry); clearInterval(this.ping);
+    this.send(0xe0); this.ws?.close(); this.ready=false;
+  }
+}
+
+
+const video=document.getElementById('video'),start=document.getElementById('start'),stop=document.getElementById('stop'),status=document.getElementById('status'),placeholder=document.getElementById('placeholder'),live=document.getElementById('live');
+let stream=null;
+const overlay=document.getElementById('overlay'),paint=overlay.getContext('2d'),sample=document.createElement('canvas'),read=sample.getContext('2d',{willReadFrequently:true}),threshold=document.getElementById('threshold'),thresholdValue=document.getElementById('thresholdValue'),meters=document.getElementById('meters');
+const capture=document.getElementById('capture'),adaptation=document.getElementById('adaptation'),adaptationValue=document.getElementById('adaptationValue');
+adaptation.addEventListener('input',()=>adaptationValue.value=Number(adaptation.value).toFixed(1)+'% per update');
+let reference=null,regions=[],lastSample=0,animation=0;
+threshold.addEventListener('input',()=>thresholdValue.value=threshold.value+'%');
+const presence=[0,0,0];
+const mqtt=new PresenceMQTT('wss://mqtt.marcobrianza.it:8084/mqtt',['naba/test01/a','naba/test01/b','naba/test01/c'],(kind,message)=>{
+ if(kind==='status')document.getElementById('mqttStatus').textContent='MQTT: '+message;
+ else document.getElementById('mqttLast').textContent='Last sent: '+message+' at '+new Date().toLocaleTimeString();
+});
+function updatePresence(values){
+ values.forEach((value,i)=>presence[i]=value?1:0);
+ document.getElementById('mqttStates').textContent=presence.map((v,i)=>['a','b','c'][i]+': '+v).join(' · ');
+ mqtt.update(presence);
+}
+mqtt.connect();
+function configure(){
+ const w=240,h=Math.max(1,Math.round(w*video.videoHeight/video.videoWidth));
+ sample.width=w;sample.height=h;overlay.width=w*4;overlay.height=h*4;
+ document.querySelector('.screen').style.aspectRatio=w+'/'+h;
+ const radius=Math.min(w/6,h/2)-2;
+ regions=[0,1,2].map(i=>{const cx=w*(i+.5)/3,cy=h/2,indices=[];for(let y=0;y<h;y++)for(let x=0;x<w;x++)if((x+.5-cx)**2+(y+.5-cy)**2<=radius**2)indices.push((y*w+x)*4);return{cx,cy,radius,indices};});
+ updatePresence([0,0,0]);reference=null;lastSample=0;capture.textContent='Capture reference frame';status.textContent='Camera live. Capture a reference frame to begin comparison.';
+}
+function differencePercent(current,before,indices){
+ let changed=0;
+ for(const p of indices){const difference=(Math.abs(current[p]-before[p])+Math.abs(current[p+1]-before[p+1])+Math.abs(current[p+2]-before[p+2]))/3;if(difference>24)changed++;}
+ return indices.length?100*changed/indices.length:0;
+}
+function adaptReference(reference,current,alpha){
+ for(let p=0;p<reference.length;p+=4){
+  for(let c=0;c<3;c++)reference[p+c]+=alpha*(current[p+c]-reference[p+c]);
+ }
+}
+function drawCircles(scores,now){
+ const states=scores.map(score=>reference!==null&&score>=Number(threshold.value));
+ updatePresence(states);
+ paint.clearRect(0,0,overlay.width,overlay.height);
+ regions.forEach((region,i)=>{const active=states[i];paint.beginPath();paint.arc(region.cx*4,region.cy*4,region.radius*4,0,Math.PI*2);if(active){paint.fillStyle='#fff';paint.fill();}paint.strokeStyle=active?'#fff':'#c5f387';paint.lineWidth=3;paint.stroke();});
+ meters.textContent=scores.map((score,i)=>['Left','Center','Right'][i]+': '+score.toFixed(1)+'%').join(' · ');
+}
+function processFrame(now){
+ if(!stream)return;
+ if(video.readyState>=2&&now-lastSample>=1000/15){
+  lastSample=now;
+  if(sample.width!==240||sample.height!==Math.max(1,Math.round(240*video.videoHeight/video.videoWidth)))configure();
+  read.drawImage(video,0,0,sample.width,sample.height);
+  const current=read.getImageData(0,0,sample.width,sample.height).data;
+  const scores=reference?regions.map(region=>differencePercent(current,reference,region.indices)):[0,0,0];
+  drawCircles(scores,now);
+  if(reference)adaptReference(reference,current,Number(adaptation.value)/100);
+ }
+ animation=requestAnimationFrame(processFrame);
+}
+function stopProcessing(){updatePresence([0,0,0]);cancelAnimationFrame(animation);reference=null;capture.disabled=true;capture.textContent='Capture reference frame';paint.clearRect(0,0,overlay.width,overlay.height);meters.textContent='Left: 0.0% · Center: 0.0% · Right: 0.0%';}
+
+function reset(message){stopProcessing();if(stream)stream.getTracks().forEach(track=>track.stop());stream=null;video.srcObject=null;start.disabled=false;stop.disabled=true;placeholder.hidden=false;live.textContent='Camera off';live.classList.remove('active');status.textContent=message;}
+start.addEventListener('click',async()=>{
+ start.disabled=true;status.textContent='Waiting for camera access…';
+ try{
+  if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia)throw new Error('Open this page over HTTPS or on localhost to use the camera.');
+  stream=await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+  video.srcObject=stream;await video.play();placeholder.hidden=true;stop.disabled=false;live.textContent='● Live';live.classList.add('active');configure();capture.disabled=false;animation=requestAnimationFrame(processFrame);
+  stream.getVideoTracks()[0].addEventListener('ended',()=>reset('Camera access ended. Start again to reconnect.'));
+ }catch(error){const messages={NotAllowedError:'Camera access was not allowed. Enable camera permission for this page in your browser, then try again.',NotFoundError:'No camera was found. Connect a webcam and try again.',NotReadableError:'The camera could not be opened. Close other apps using it and try again.',SecurityError:'Camera access is blocked by your browser settings.'};reset(messages[error.name]||error.message||'Could not start the camera. Please try again.');}
+});
+capture.addEventListener('click',()=>{
+ if(!stream||video.readyState<2){status.textContent='Wait for the camera image, then capture again.';return;}
+ try{
+ const height=Math.max(1,Math.round(240*video.videoHeight/video.videoWidth));
+ if(sample.width!==240||sample.height!==height)configure();
+ read.drawImage(video,0,0,sample.width,sample.height);
+ // Floating-point storage preserves small fractional changes over time.
+ reference=new Float32Array(read.getImageData(0,0,sample.width,sample.height).data);
+ drawCircles([0,0,0],performance.now());
+ capture.textContent='Reset reference frame';
+ status.textContent='Reference captured. Comparing first, then gradually blending in each live frame.';
+ }catch(error){status.textContent='Reference capture failed: '+error.message;}
+});
+stop.addEventListener('click',()=>reset('Camera stopped.'));
+window.addEventListener('pagehide',()=>{reset('Camera stopped.');mqtt.close();});
+window.addEventListener('pageshow',()=>{if(!mqtt.enabled)mqtt.connect();});
+</script>
+</body>
+</html>
