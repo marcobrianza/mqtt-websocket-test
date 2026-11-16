@@ -1,0 +1,86 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NABA MQTT debugger</title><style>*{box-sizing:border-box}body{margin:0;background:#111614;color:#edf3ed;font:16px system-ui,sans-serif;padding:clamp(20px,5vw,64px)}main{max-width:1100px;margin:auto}h1{font-size:clamp(28px,4vw,42px);font-weight:550;letter-spacing:-.04em;margin:8px 0 20px}.eyebrow{color:#b6ceab;font-size:12px;letter-spacing:.14em}.muted{color:#aebcb2;line-height:1.6}.panel{background:#1b251f;border:1px solid #3b5042;border-radius:16px;padding:24px;margin:24px 0}h2{margin:0 0 18px;font-size:22px}label{display:block;margin:18px 0 8px}input,textarea{width:100%;padding:12px;background:#111614;color:#edf3ed;border:1px solid #526956;border-radius:8px;font:15px ui-monospace,monospace}textarea{min-height:110px;resize:vertical}button{padding:11px 18px;background:#c5f387;color:#14220e;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.4;cursor:default}:focus-visible{outline:3px solid white;outline-offset:3px}.bar{display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin:18px 0}.table{overflow:auto;max-height:580px}table{width:100%;border-collapse:collapse;text-align:left;font-size:14px}th,td{padding:12px;border-bottom:1px solid #34463a;vertical-align:top}th{position:sticky;top:0;background:#1b251f}td pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:14px ui-monospace,monospace;max-width:550px;max-height:220px;overflow:auto}td:nth-child(3){overflow-wrap:anywhere;min-width:160px}.rx{color:#c5f387}.tx{color:#8dcaff}a{color:#c5f387}code{overflow-wrap:anywhere}</style></head><body><main><p class="eyebrow">NABA · MQTT TOOLS</p><h1>MQTT debugger</h1><p id="connection" role="status">Connecting…</p><p class="muted">Automatically subscribes to <code>naba/#</code> on <code>wss://mqtt.marcobrianza.it:8084/mqtt</code>. Topics are case-sensitive. Keep this page open to receive messages.</p>
+<section class="panel"><h2>Publish a message</h2><form id="publish"><label for="topic">Topic</label><input id="topic" value="naba/something" required spellcheck="false" autocomplete="off"><label for="payload">Payload</label><textarea id="payload" placeholder="Enter a payload — text, a number, or JSON" spellcheck="false"></textarea><div class="bar"><button id="send" disabled type="submit">Send message</button><span class="muted">QoS 0 · not retained</span></div><p id="sendStatus" role="status">Waiting for connection.</p></form></section>
+<section class="panel"><div class="bar"><h2>Message monitor</h2><button id="clear" type="button">Clear messages</button></div><p class="muted" id="count">Received: 0 · Sent: 0 · Showing: 0</p><p class="muted">Newest first · latest 200 entries. Published messages under naba/# also appear as received when echoed by the broker.</p><div class="table"><table><thead><tr><th>Time</th><th>Direction</th><th>Topic</th><th>Payload</th></tr></thead><tbody id="messages"></tbody></table></div><p id="empty" class="muted">Waiting for messages on naba/#…</p></section><p class="muted"><a href="webcam.html">Webcam viewer</a> · <a href="control.html">Color control</a></p><script>class PresenceMQTT {
+  constructor(url, topics, report) {
+    this.url=url; this.topics=topics; this.report=report;
+    this.values=topics.map(()=>0); this.sent=topics.map(()=>null);
+    this.encoder=new TextEncoder(); this.enabled=false; this.ready=false;
+  }
+  text(value) { const b=this.encoder.encode(value); return [b.length>>8,b.length&255,...b]; }
+  send(header, body=[]) {
+    if(this.ws?.readyState!==1) return false;
+    let n=body.length, length=[];
+    do { const d=n%128; n=Math.floor(n/128); length.push(d|(n?128:0)); } while(n);
+    try { this.ws.send(new Uint8Array([header,...length,...body])); return true; }
+    catch { this.ws.close(); return false; }
+  }
+  connect() {
+    this.enabled=true; clearTimeout(this.retry);
+    if(this.ws&&this.ws.readyState<2)return;
+    this.ready=false; this.sent=this.topics.map(()=>null); this.buffer=new Uint8Array();
+    this.report('status','Connecting…');
+    let socket;
+    try { socket=new WebSocket(this.url,'mqtt'); } catch { this.scheduleRetry(); return; }
+    this.ws=socket; socket.binaryType='arraybuffer';
+    const timeout=setTimeout(()=>socket.close(),10000);
+    socket.onopen=()=>{
+      if(this.ws!==socket)return;
+      const id='debug-'+crypto.getRandomValues(new Uint32Array(2)).join('-');
+      this.send(0x10,[...this.text('MQTT'),4,2,0,30,...this.text(id)]);
+      this.lastReceived=Date.now();
+      this.ping=setInterval(()=>{
+        if(Date.now()-this.lastReceived>45000)socket.close();
+        else this.send(0xc0);
+      },15000);
+    };
+    socket.onmessage=event=>{
+      if(this.ws!==socket)return;
+      this.lastReceived=Date.now();
+      const incoming=new Uint8Array(event.data), merged=new Uint8Array(this.buffer.length+incoming.length);
+      merged.set(this.buffer); merged.set(incoming,this.buffer.length); this.buffer=merged;
+      while(this.buffer.length>=2) {
+        let n=0,m=1,i=1,d;
+        do {
+          if(i>=this.buffer.length)return;
+          d=this.buffer[i++]; n+=(d&127)*m; m*=128;
+          if(i>5){socket.close();return;}
+        } while(d&128);
+        if(n>1048576){socket.close();return;}
+        if(this.buffer.length<i+n)return;
+        const type=this.buffer[0]>>4, body=this.buffer.slice(i,i+n);
+        this.buffer=this.buffer.slice(i+n);
+        if(type===9) { if(body.length!==2+this.topics.length||body.slice(2).some(code=>code===128)){socket.close();return;} this.ready=true; this.report('status','Connected · subscribed to naba/#'); }
+        if(type===3 && body.length>=2) { const size=(body[0]<<8)|body[1]; if(size+2<=body.length){const topic=new TextDecoder().decode(body.slice(2,2+size));const payload=new TextDecoder().decode(body.slice(2+size)); this.report('message',{topic,payload});} }
+        if(type===2) {
+          clearTimeout(timeout);
+          if(body.length!==2||body[1]!==0){this.report('status','Broker refused connection');socket.close();return;}
+          this.send(0x82,[0,1,...this.topics.flatMap(topic=>[...this.text(topic),0])]);
+        }
+      }
+    };
+    socket.onerror=()=>this.report('status','Connection error: check network or broker');
+    socket.onclose=()=>{
+      clearTimeout(timeout);
+      if(this.ws!==socket)return;
+      clearInterval(this.ping); this.ready=false; this.ws=null;
+      if(this.enabled)this.scheduleRetry();
+    };
+  }
+  scheduleRetry() {
+    this.report('status','Disconnected · retrying in 3 seconds');
+    clearTimeout(this.retry); this.retry=setTimeout(()=>this.connect(),3000);
+  }
+  close() {
+    this.enabled=false; clearTimeout(this.retry); clearInterval(this.ping);
+    this.send(0xe0); this.ws?.close(); this.ready=false;
+  }
+}
+
+let received=0,sent=0;
+function addMessage(direction,topic,payload){if(direction==='RX')received++;else sent++;const row=document.createElement('tr');[new Date().toLocaleTimeString(),direction,topic,payload].forEach((value,i)=>{const td=document.createElement('td');if(i===3){const pre=document.createElement('pre');pre.textContent=value;td.append(pre);}else td.textContent=value;if(i===1)td.className=direction.toLowerCase();row.append(td);});const list=document.getElementById('messages');list.prepend(row);while(list.children.length>200)list.lastElementChild.remove();document.getElementById('empty').hidden=true;updateCount();}
+function updateCount(){document.getElementById('count').textContent='Received: '+received+' · Sent: '+sent+' · Showing: '+document.getElementById('messages').children.length;}
+const mqtt=new PresenceMQTT('wss://mqtt.marcobrianza.it:8084/mqtt',['naba/#'],(kind,value)=>{if(kind==='status'){document.getElementById('connection').textContent='MQTT: '+value;document.getElementById('send').disabled=!mqtt.ready;document.getElementById('sendStatus').textContent=mqtt.ready?'Ready to publish.':'Waiting for connection.';}else if(kind==='message')addMessage('RX',value.topic,value.payload);});
+document.getElementById('publish').addEventListener('submit',event=>{event.preventDefault();const topic=document.getElementById('topic').value,payload=document.getElementById('payload').value,status=document.getElementById('sendStatus');if(!topic||/[+#\u0000]/.test(topic)||mqtt.encoder.encode(topic).length>65535){status.textContent='Enter a nonempty topic without +, #, or null characters (maximum 65,535 bytes).';return;}if(mqtt.encoder.encode(payload).length>65536){status.textContent='Payload is too large. Maximum 64 KB.';return;}if(!mqtt.ready){status.textContent='Not connected. Please wait for reconnection.';return;}if(mqtt.send(0x30,[...mqtt.text(topic),...mqtt.encoder.encode(payload)])){addMessage('TX',topic,payload);status.textContent='Sent to '+topic+' at '+new Date().toLocaleTimeString();}else status.textContent='Send failed. Waiting for reconnection.';});
+document.getElementById('clear').addEventListener('click',()=>{document.getElementById('messages').replaceChildren();received=0;sent=0;updateCount();document.getElementById('empty').hidden=false;});
+mqtt.connect();window.addEventListener('pagehide',()=>mqtt.close());window.addEventListener('pageshow',()=>{if(!mqtt.enabled)mqtt.connect();});
+</script></main></body></html>
