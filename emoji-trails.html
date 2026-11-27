@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emoji Trails</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; overflow: hidden; background: #000; color: #eee; font: 14px system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  #trails { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #palette { position: absolute; inset: 0 0 0; display: flex; }
+  #palette span { flex: 1; display: grid; place-items: center; background: #161616; border: 1px solid #333; font-size: clamp(18px, 6vmin, 64px); }
+  .circle { position: absolute; transform: translate(-50%, -50%); display: grid; place-items: center; width: clamp(24px, 7vmin, 84px); aspect-ratio: 1; border: 1px solid #ddd; border-radius: 50%; background: #171717; font-size: clamp(16px, 4.5vmin, 48px); z-index: 1; }
+  #controls { position: fixed; inset: 16px 16px auto; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; padding: 10px 12px; background: #151515; border: 1px solid #444; border-radius: 9px; width: fit-content; max-width: calc(100% - 32px); }
+  #controls[hidden] { display: none; }
+  #status { color: #bbb; overflow-wrap: anywhere; }
+  button { color: inherit; background: #252525; border: 1px solid #666; border-radius: 5px; padding: 6px 10px; cursor: pointer; }
+  .clean { cursor: none; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
+</head>
+<body>
+<div id="stage" aria-label="Live circle visualization"><canvas id="trails" aria-hidden="true"></canvas><div id="palette" aria-label="Emoji palette"></div></div>
+<div id="controls">
+  <span id="status" role="status">Connecting to MQTT…</span>
+  <button id="test">Test emojis</button>
+  <button id="clear">Clear trails</button>
+  <button id="full">Fullscreen</button>
+  <span>Payload <code>0.25 0.70</code> (x y) · Move into the strip to pick an emoji · H toggles controls</span>
+</div>
+<script>
+const broker = 'wss://mqtt.marcobrianza.it:8084/mqtt';
+const subscription = 'naba/position/+';
+const timeout = 30_000;
+const stage = document.getElementById('stage');
+const controls = document.getElementById('controls');
+const status = document.getElementById('status');
+const circles = new Map();
+const trails = document.getElementById('trails');
+const ink = trails.getContext('2d');
+const pawPrints = new Map();
+const pawHold = 10_000;
+const pawFade = 3_000;
+let pawFrame = null;
+
+function resizeTrails() {
+  const pixelRatio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(stage.clientWidth * pixelRatio));
+  const height = Math.max(1, Math.round(stage.clientHeight * pixelRatio));
+  if (trails.width === width && trails.height === height) return;
+
+  const scaleX = width / trails.width;
+  const scaleY = height / trails.height;
+  for (const print of Array.from(pawPrints.values()).flat()) {
+    print.x *= scaleX;
+    print.y *= scaleY;
+    print.radius *= Math.max(scaleX, scaleY);
+  }
+  for (const circle of circles.values()) circle.stepRemaining = undefined;
+  trails.width = width;
+  trails.height = height;
+  schedulePawFrame();
+}
+
+function stampEmoji(print) {
+  ink.save();
+  ink.translate(print.x, print.y);
+  ink.rotate(print.angle + Math.PI / 2);
+  ink.font = (print.radius * 1.3) + 'px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  ink.textAlign = 'center';
+  ink.textBaseline = 'middle';
+  ink.fillText(print.emoji, 0, 0, print.radius * 1.3);
+  ink.restore();
+}
+
+function schedulePawFrame() {
+  if (pawFrame === null && pawPrints.size) pawFrame = requestAnimationFrame(renderPaws);
+}
+
+function renderPaws(now) {
+  pawFrame = null;
+  ink.clearRect(0, 0, trails.width, trails.height);
+  for (const [id, prints] of pawPrints) {
+    const visible = prints.filter(print => now - print.created < pawHold + pawFade);
+    if (visible.length) pawPrints.set(id, visible);
+    else pawPrints.delete(id);
+    for (const print of visible) {
+      ink.globalAlpha = Math.min(1, 1 - (now - print.created - pawHold) / pawFade);
+      stampEmoji(print);
+    }
+  }
+  ink.globalAlpha = 1;
+  schedulePawFrame();
+}
+
+function leavePrints(id, circle, x, y, emoji) {
+  const startX = circle.x * trails.width;
+  const startY = circle.y * trails.height;
+  const dx = x * trails.width - startX;
+  const dy = y * trails.height - startY;
+  const distance = Math.hypot(dx, dy);
+  if (!distance) return;
+
+  const radius = Math.max(10 * (window.devicePixelRatio || 1), 0.024 * Math.min(trails.width, trails.height));
+  const stride = radius * 2.7;
+  const angle = Math.atan2(dy, dx);
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const created = performance.now();
+  const prints = (pawPrints.get(id) ?? []).filter(print => created - print.created < pawHold + pawFade);
+  let step = circle.stepRemaining ?? stride / 2;
+  let side = circle.pawSide ?? -1;
+  for (; step <= distance; step += stride) {
+    const printX = startX + ux * step - uy * side * radius * 0.65;
+    const printY = startY + uy * step + ux * side * radius * 0.65;
+    if (printY + radius >= trails.height * paletteStart) continue;
+    if (prints.some(print =>
+      Math.hypot(print.x - printX, print.y - printY) < print.radius + radius
+    )) continue;
+    prints.push({ x: printX, y: printY, radius, angle, emoji, created });
+    side = -side;
+  }
+  if (prints.length) {
+    pawPrints.set(id, prints);
+    schedulePawFrame();
+  }
+  circle.stepRemaining = step - distance;
+  circle.pawSide = side;
+}
+
+resizeTrails();
+window.addEventListener('resize', resizeTrails);
+document.getElementById('clear').addEventListener('click', () => {
+  ink.clearRect(0, 0, trails.width, trails.height);
+  pawPrints.clear();
+  for (const circle of circles.values()) {
+    circle.stepRemaining = undefined;
+    circle.pawSide = undefined;
+  }
+});
+const paletteStart = 0.88;
+const catalog = ('🐷 🐈 🍍 🎄 🐙 🦋 🐢 🦀 🦉 🐬 🦒 🐘 🦔 🐧 🐝 ' +
+  '🍉 🍋 🍒 🍓 🥝 🥑 🌽 🍄 🥕 🥨 🧀 🍕 🍩 🍪 🍰 🍿 🍦 🥐 🥥 🍇 ' +
+  '🌵 🌻 🌷 🌴 🍁 🍀 🌈 ⭐ 🌙 🪐 ☀️ ❄️ 🔥 🌊 ⚡ 💎 🎈 🎁 🎩 👑 ' +
+  '🎸 🎷 🎺 🥁 🎹 🎻 🪁 🧩 🎲 🛹 ⚽ 🏀 🎾 🎯 🏆 🎨 🖍️ 📷 🔔 ' +
+  '🚀 🚲 🚗 🚂 ✈️ 🚁 ⛵ ⚓ 🛸 🏰 🎡 ⛺ 🗽 🗼 🏝️ 🏔️ 🧭 ' +
+  '🔑 🔒 💡 🕯️ ⏰ ☂️ 🧲 🧸 🪴 🧺 🧵 📚 ✂️ 🧪 🔮').split(' ');
+const palette = document.getElementById('palette');
+palette.style.top = (paletteStart * 100) + '%';
+const refillDelay = 3000;
+let deck = [];
+const slots = [];
+
+function nextEmoji() {
+  if (!deck.length) {
+    deck = catalog.slice();
+    for (let i = deck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+  }
+  const index = deck.findIndex(emoji => !slots.some(slot => slot.emoji === emoji));
+  if (index >= 0) return deck.splice(index, 1)[0];
+
+  // A few remaining icons can still be on the strip from the previous cycle.
+  const available = catalog.filter(emoji => !slots.some(slot => slot.emoji === emoji));
+  return available[Math.floor(Math.random() * available.length)];
+
+}
+
+for (let i = 0; i < 7; i++) {
+  const swatch = document.createElement('span');
+  const emoji = nextEmoji();
+  swatch.textContent = emoji;
+  palette.append(swatch);
+  slots.push({ swatch, emoji });
+}
+
+function pickEmoji(slot) {
+  const emoji = slot.emoji;
+  if (!emoji) return null;
+  slot.emoji = null;
+  slot.swatch.textContent = '';
+  setTimeout(() => {
+    slot.emoji = nextEmoji();
+    slot.swatch.textContent = slot.emoji;
+  }, refillDelay);
+  return emoji;
+}
+
+const selectedEmojis = new Map();
+let connection = 'Connecting to MQTT…';
+let received = 0;
+let lastMessage = '';
+
+function updateStatus() {
+  status.textContent = [connection, circles.size + ' active circles', received + ' received', lastMessage]
+    .filter(Boolean).join(' · ');
+}
+
+function parsePosition(raw) {
+  const coordinates = raw.trim().split(/\s+/);
+  if (coordinates.length !== 2) return null;
+  if (!coordinates.every(value => /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))) return null;
+
+  const [x, y] = coordinates.map(Number);
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? [x, y] : null;
+}
+
+function draw(id, [x, y]) {
+  const previousEmoji = selectedEmojis.get(id);
+  const slotIndex = y >= paletteStart ? Math.min(6, Math.floor(x * 7)) : -1;
+  let circle = circles.get(id);
+  if (!circle) {
+    const element = document.createElement('div');
+    element.className = 'circle';
+    stage.append(element);
+    circle = { element };
+    circles.set(id, circle);
+  } else if (previousEmoji) {
+    leavePrints(id, circle, x, y, previousEmoji);
+  }
+  if (slotIndex >= 0 && slotIndex !== circle.slotIndex) {
+    const emoji = pickEmoji(slots[slotIndex]);
+    if (emoji) selectedEmojis.set(id, emoji);
+  }
+  circle.slotIndex = slotIndex;
+  circle.x = x;
+  circle.y = y;
+  circle.element.style.left = (x * 100) + '%';
+  circle.element.style.top = (y * 100) + '%';
+  circle.element.textContent = selectedEmojis.get(id) ?? '○';
+  clearTimeout(circle.timer);
+  circle.timer = setTimeout(() => {
+    circle.element.remove();
+    circles.delete(id);
+    updateStatus();
+  }, timeout);
+}
+
+function receive(topic, payload) {
+  if (!/^naba\/position\/\d+$/.test(topic)) return;
+  received++;
+  const position = parsePosition(payload.toString());
+  lastMessage = topic + (position ? ' ' + position.join(' ') : ' · invalid position');
+  if (position) draw(topic, position);
+  updateStatus();
+}
+
+function showControls(show) {
+  controls.hidden = !show;
+  document.body.classList.toggle('clean', !show);
+}
+
+const fullscreen = document.getElementById('full');
+fullscreen.addEventListener('click', async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+  } catch {
+    status.textContent = 'Use your browser’s fullscreen command, then press H to hide controls.';
+  }
+});
+document.addEventListener('fullscreenchange', () => showControls(!document.fullscreenElement));
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() === 'h' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    showControls(controls.hidden);
+  }
+});
+let demoInPalette = false;
+document.getElementById('test').addEventListener('click', () => {
+  demoInPalette = !demoInPalette;
+  draw('demo/1', demoInPalette ? [0.07, 0.94] : [0.47, 0.50]);
+  draw('demo/2', demoInPalette ? [0.50, 0.94] : [0.50, 0.50]);
+  draw('demo/3', demoInPalette ? [0.79, 0.94] : [0.53, 0.50]);
+  updateStatus();
+});
+
+if (window.mqtt) {
+  const client = mqtt.connect(broker, {
+    protocolVersion: 4,
+    reconnectPeriod: 2500,
+    connectTimeout: 8000,
+    resubscribe: false
+  });
+  client.on('message', receive);
+  client.on('connect', () => {
+    client.subscribe(subscription, (error, grants) => {
+      connection = error || !grants?.length || grants[0].qos >= 128
+        ? 'Subscription failed' : 'Listening on ' + subscription;
+      updateStatus();
+    });
+  });
+  client.on('close', () => { connection = 'MQTT offline · retrying'; updateStatus(); });
+  client.on('error', () => { connection = 'MQTT connection error · retrying'; updateStatus(); });
+} else {
+  connection = 'MQTT client could not load · check internet access and reload';
+}
+updateStatus();
+</script>
+</body>
+</html>
