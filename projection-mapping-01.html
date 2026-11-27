@@ -1,0 +1,892 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Projection Mapping</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#121519;color:#f0f2f4;--accent:#beff71;--line:#343c45;--panel:#1b2026;--muted:#b0bbc6}
+*{box-sizing:border-box}body{margin:0}main{max-width:830px;margin:auto;padding:28px 20px}header,.bar,.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}header{justify-content:space-between}h1{font-size:clamp(1.6rem,5vw,2.35rem);letter-spacing:-.045em;margin:0}h2{font-size:1rem;margin:0 0 12px}p{color:var(--muted);line-height:1.5}section{margin-top:16px;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:12px}button,input,textarea,select{font:inherit}button{padding:8px 12px;border-radius:7px;border:1px solid var(--line);background:#262e37;color:inherit;cursor:pointer}button:hover{border-color:var(--accent)}button.primary,button[aria-pressed=true]{background:var(--accent);color:#18220d;border-color:var(--accent)}button:disabled{opacity:.45;cursor:default}input,textarea,select{min-width:0;padding:7px;background:#121519;color:inherit;border:1px solid var(--line);border-radius:6px}input[type=color]{width:54px;height:36px;padding:3px}input[type=range]{padding:0;accent-color:var(--accent)}label{display:grid;gap:5px;color:var(--muted);font-size:.9rem}.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}.list{display:grid;gap:6px}.area{text-align:left;display:flex;align-items:center;gap:9px;overflow-wrap:anywhere}.dot{flex:none;width:10px;height:10px;border-radius:50%}#notice{min-height:1.5em;margin-bottom:0}.stage{background:#000;overflow:hidden}canvas{position:fixed;inset:0;background:#000;width:100%;height:100%;touch-action:none}.stage [hidden],[hidden]{display:none!important}@media(max-width:570px){.cols{grid-template-columns:1fr}}
+details > summary{cursor:pointer;font-weight:650}.mqtt-form{display:grid;gap:12px;margin:14px 0}.mqtt-form label input,.mqtt-form textarea{width:100%;font-family:ui-monospace,monospace}.mqtt-form textarea{min-height:72px;resize:vertical}.mqtt-log{max-height:230px;overflow:auto;background:#121519;border:1px solid var(--line);padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}.mqtt-form p{margin:0;font-size:.875rem}.mqtt-form h3{margin:0;font-size:1rem}.mqtt-actions{justify-content:space-between}#mqttStatus{color:var(--muted)}
+</style>
+<body>
+<main id="palette" hidden>
+<header><h1>Projection Mapping</h1><button id="open" class="primary">Open Projection Window</button></header>
+<p id="connection" role="status">Projection window closed.</p>
+<section>
+<h2>Mode</h2>
+<div class="bar"><button id="setup">Setup</button><button id="live">Play</button><button id="grid">Grid</button></div>
+<label style="margin-top:12px">Projection aspect ratio
+<select id="aspect"><option value="auto">Match Window</option><option>16:9</option><option>4:3</option><option>16:10</option></select>
+</label>
+</section>
+<section>
+<h2>Draw in the projection window</h2>
+<div class="bar"><button data-shape="quad">4 Corners</button><button data-shape="round">Circle</button><button id="cancel">Cancel Drawing</button></div>
+<p>Shortcuts <kbd>1</kbd> 4 Corners · <kbd>2</kbd> Circle · <kbd>S</kbd> Setup · <kbd>P</kbd> Play · <kbd>Esc</kbd> Cancel. Use them in either window.</p>
+<p>In Setup, click an area to select it. Drag inside to move it, or drag a corner handle to reshape it.</p>
+<p>Click the projection window and press <kbd>F</kbd> to toggle fullscreen. Move it onto a projector screen first if you use one.</p>
+<p id="notice" role="status"></p>
+</section>
+<div class="cols">
+<section><h2>Areas</h2><div id="areas" class="list"></div></section>
+<section><h2>Area Properties</h2><div id="properties" hidden>
+<label >Name<input id="name" maxlength="80"></label>
+<div class="row" style="margin-block:12px"><label >Color<input id="color" type="color"></label><label>Layer (z-index)<input id="z" type="number" min="-9999" max="9999" step="1" style="width:100px"></label></div>
+<label>Opacity <output id="alphaValue"></output><input id="alpha" type="range" min="0" max="100"></label>
+<div class="bar" style="margin-top:12px"><button id="redraw">Redraw</button><button id="remove" >Delete</button></div>
+</div><p id="emptyProperties">Select an area.</p></section>
+</div>
+<section id="mqttPanel">
+<details open>
+<summary>MQTT Debug</summary>
+<form id="mqttSettings" class="mqtt-form">
+<div class="cols">
+<label>Broker WebSocket URL<input id="mqttBroker" type="url" required></label>
+<label>Topic root<input id="mqttRoot" placeholder="naba/test01"></label>
+</div>
+<label>Subscription filters, one per line<textarea id="mqttFilters" spellcheck="false" required></textarea></label>
+<p>Filters are relative to the topic root. The app also subscribes to naba/kinect/fatcat/position for Area 2.</p>
+<div class="bar"><button id="mqttApply" type="submit">Apply &amp; Connect</button><button id="mqttDisconnect" type="button" disabled>Disconnect</button><span id="mqttStatus" role="status">Disconnected</span></div>
+</form>
+<form id="mqttSimulator" class="mqtt-form">
+<h3>Simulate an incoming message</h3>
+<div class="cols"><label>Topic<input id="mqttTopic" required placeholder="a"></label><label>Payload<input id="mqttPayload" placeholder="1"></label></div>
+<div class="bar mqtt-actions"><button type="submit">Simulate Receive</button><button id="mqttClear" type="button">Clear Log</button></div>
+<p id="mqttSimulationStatus" role="status">To test Area 2, enter naba/kinect/fatcat/position and a value from 0 to 1.</p>
+</form>
+<pre id="mqttLog" class="mqtt-log" role="log" aria-label="Incoming MQTT messages">No messages yet.</pre>
+</details>
+</section>
+<section class="bar"><button id="export">Export JSON</button><button id="import">Import JSON</button><input id="file" type="file" accept=".json,application/json" hidden></section>
+</main>
+<div id="projection" hidden>
+<canvas id="canvas" aria-label="Projection surface"></canvas>
+</div>
+<script>
+'use strict';
+const byId = id => document.getElementById(id);
+const projectionHash = '#projector';
+const isProjection = location.hash === projectionHash || location.hash === '#proiettore';
+const aspectRatios = {'16:9':16/9,'4:3':4/3,'16:10':16/10};
+
+function fitProjection(viewWidth, viewHeight, aspect) {
+  const ratio = aspectRatios[aspect];
+  const width = ratio ? Math.min(viewWidth,viewHeight*ratio) : viewWidth;
+  const height = ratio ? Math.min(viewHeight,viewWidth/ratio) : viewHeight;
+  return {width,height,left:(viewWidth-width)/2,top:(viewHeight-height)/2};
+}
+const storageKey = 'naba.projection-mapping.v1';
+// File URLs have browser-dependent origins. Validate the peer window in listen().
+const messageOrigin = location.protocol === 'file:' || location.origin === 'null' ? '*' : location.origin;
+const shortcuts = {'1':'quad','2':'round','3':'round',s:'setup',p:'live',escape:'cancel'};
+function shortcutKey(event) {
+  if (event.repeat || event.metaKey || event.ctrlKey || event.altKey ||
+      event.target?.closest?.('input, textarea, select, [contenteditable]')) return '';
+  return event.key.toLowerCase();
+}
+const materials = ['#baff72','#63b9ff','#ff798f','#ffd069','#ba93ff'];
+const instructions = {
+  quad: 'Click the four corners in order around the perimeter.',
+  round: 'Click four corners around the circle’s frame. A square produces a circle.'
+};
+const shapeName = {quad:'4 Corners',round:'Circle',ellipse:'Circle',circle:'Circle'};
+const pointCount = shape => ['ellipse','circle'].includes(shape) ? 2 : 4;
+const initial = () => ({version:1, areas:[]});
+const kinectTopic = 'naba/kinect/fatcat/position';
+const mqttDefaults = {broker:'wss://mqtt.marcobrianza.it:8084/mqtt', root:'naba/test01', filters:['a','b','c']};
+
+function mqttConfig(broker,root,filters) {
+  const url = new URL(broker);
+  if (!['ws:','wss:'].includes(url.protocol) || url.username || url.password || url.hash) {
+    throw Error('Enter a ws:// or wss:// broker URL without credentials or a fragment.');
+  }
+  if (/[+#\u0000]/.test(root)) throw Error('The topic root must not contain wildcards.');
+  if (!filters.length || filters.some(filter => {
+    const levels = filter.split('/');
+    return !filter || /^\$share\//.test(filter) || levels.some((level,index) =>
+      /\u0000/.test(level) || (/[+#]/.test(level) && level !== '+' &&
+        !(level === '#' && index === levels.length - 1)));
+  })) throw Error('Enter valid MQTT subscription filters, one per line.');
+  return {broker:url.href,root,filters:[...new Set(filters)]};
+}
+
+function fullTopic(root, suffix) {
+  return root ? root + '/' + suffix : suffix;
+}
+
+function matchesTopic(filter, topic) {
+  if (topic.startsWith('$') && !filter.startsWith('$')) return false;
+  const parts = topic.split('/');
+  return filter.split('/').every((level,index,array) =>
+    level === '#' || (index < parts.length && (level === '+' || level === parts[index]) &&
+      (index < array.length - 1 || parts.length === array.length)));
+}
+const ordered = areas => [...areas].sort((a,b) => a.z - b.z);
+const isUnit = value => Number.isFinite(value) && value >= 0 && value <= 1;
+
+function validGeometry(shape, points) {
+  if (shape === 'ellipse') return points[0][0] !== points[1][0] && points[0][1] !== points[1][1];
+  if (shape === 'circle') return points[0].some((value,index) => value !== points[1][index]);
+  const turns = points.map(([x,y],index) => {
+    const [bx,by] = points[(index+1)%4];
+    const [cx,cy] = points[(index+2)%4];
+    return (bx-x)*(cy-by)-(by-y)*(cx-bx);
+  });
+  return turns.every(turn => turn > 1e-8) || turns.every(turn => turn < -1e-8);
+}
+
+function validPoints(shape,points) {
+  return Array.isArray(points) && points.length === pointCount(shape) &&
+    points.every(point => Array.isArray(point) && point.length === 2 && point.every(isUnit)) &&
+    validGeometry(shape,points);
+}
+
+function readProject(project) {
+  const ids = new Set();
+  if (project?.version !== 1 || !Array.isArray(project.areas)) throw Error('Unsupported project format.');
+  for (const area of project.areas) {
+    if (!area || typeof area.id !== 'string' || !area.id || ids.has(area.id) ||
+        typeof area.name !== 'string' || area.name.length > 80 ||
+        !Object.hasOwn(shapeName,area.shape) || !/^#[0-9a-f]{6}$/i.test(area.color) ||
+        !Number.isInteger(area.z) || Math.abs(area.z) > 9999 || !isUnit(area.alpha) ||
+        !validPoints(area.shape,area.points)) throw Error('The file contains an invalid area.');
+    ids.add(area.id);
+  }
+  if (project.aspect !== undefined && project.aspect !== 'auto' && !Object.hasOwn(aspectRatios,project.aspect)) {
+    throw Error('Invalid projection aspect ratio.');
+  }
+  if (project.mqtt !== undefined) {
+    const {broker,root,filters} = project.mqtt;
+    if (typeof broker !== 'string' || typeof root !== 'string' ||
+        !Array.isArray(filters) || !filters.every(filter => typeof filter === 'string')) {
+      throw Error('Invalid MQTT settings.');
+    }
+    project.mqtt = mqttConfig(broker,root,filters);
+  }
+  return project;
+}
+
+function send(target, type, payload) {
+  target?.postMessage({app:storageKey,type,payload},messageOrigin);
+}
+
+function listen(peer, receiver) {
+  addEventListener('message', event => {
+    if (event.source === peer() && (messageOrigin === '*' || event.origin === messageOrigin) &&
+        event.data?.app === storageKey) receiver(event.data.type,event.data.payload);
+  });
+}
+
+function subscriptionTopics(root,filters) {
+  const topics = filters.map(filter => fullTopic(root,filter));
+  if (!topics.some(filter => matchesTopic(filter,kinectTopic))) topics.push(kinectTopic);
+  return topics;
+}
+
+function kinectPosition(payload) {
+  const value = payload.trim();
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value)) return null;
+  const position = Number(value);
+  return position >= 0 && position <= 1 ? position : null;
+}
+
+function setupMqtt(saveSettings) {
+  let client = null, attempt = 0, library = null;
+  const logs = [];
+  const status = (message,active) => {
+    byId('mqttStatus').textContent = message;
+    byId('mqttDisconnect').disabled = !active;
+  };
+  function disconnect() {
+    attempt++;
+    const previous = client;
+    client = null;
+    previous?.end(true);
+    status('Disconnected',false);
+  }
+  function readSettings() {
+    return mqttConfig(byId('mqttBroker').value.trim(),
+      byId('mqttRoot').value.trim().replace(/^\/+|\/+$/g,''),
+      byId('mqttFilters').value.split('\n').map(filter => filter.trim()).filter(Boolean));
+  }
+  function load(settings) {
+    disconnect();
+    byId('mqttBroker').value = settings.broker;
+    byId('mqttRoot').value = settings.root;
+    byId('mqttFilters').value = settings.filters.join('\n');
+  }
+  function receive(source,topic,payload) {
+    const entry = {source,topic,payload};
+    const preview = payload.length > 2048 ? payload.slice(0,2048) + '…' : payload;
+    logs.push(new Date().toLocaleTimeString('en-GB') + '  ' + source + '  ' + topic + '\n' + preview);
+    if (logs.length > 60) logs.shift();
+    const log = byId('mqttLog');
+    log.textContent = logs.join('\n\n');
+    log.scrollTop = log.scrollHeight;
+    window.dispatchEvent(new CustomEvent('projection-mapping:message',{detail:entry}));
+  }
+  function loadClient() {
+    if (!library) {
+      library = new Promise((resolve,reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
+        script.onload = () => window.mqtt?.connect ? resolve(window.mqtt) : reject(Error('MQTT client unavailable.'));
+        script.onerror = () => { script.remove(); reject(Error('MQTT client could not be loaded.')); };
+        document.head.append(script);
+      }).catch(error => { library = null; throw error; });
+    }
+    return library;
+  }
+  byId('mqttSettings').onsubmit = async event => {
+    event.preventDefault();
+    let settings;
+    try { settings = readSettings(); }
+    catch (error) { status(error.message,Boolean(client)); return; }
+    disconnect();
+    const current = attempt;
+    saveSettings(settings);
+    status('Connecting…',true);
+    try {
+      const mqtt = await loadClient();
+      if (current !== attempt) return;
+      const connection = mqtt.connect(settings.broker,{
+        protocolVersion:4, reconnectPeriod:2000, connectTimeout:10000, resubscribe:false
+      });
+      client = connection;
+      connection.on('connect',() => {
+        if (client !== connection) return;
+        status('Connected · subscribing…',true);
+        const topics = subscriptionTopics(settings.root,settings.filters);
+        connection.subscribe(topics,{qos:0},(error,granted) => {
+          if (client !== connection || !connection.connected) return;
+          const accepted = (granted || []).filter(item => item.qos <= 2).length;
+          status(error ? 'Connected · subscription failed' :
+            'Connected · ' + accepted + '/' + topics.length + ' filters accepted',true);
+        });
+      });
+      connection.on('reconnect',() => { if (client === connection) status('Reconnecting…',true); });
+      connection.on('close',() => { if (client === connection) status('Disconnected · retrying…',true); });
+      connection.on('error',error => { if (client === connection) status('MQTT error · ' + error.message,true); });
+      connection.on('message',(topic,payload) => {
+        if (client === connection) receive('MQTT',topic,payload.toString());
+      });
+    } catch (error) {
+      if (current === attempt) status(error.message,false);
+    }
+  };
+  byId('mqttDisconnect').onclick = disconnect;
+  byId('mqttClear').onclick = () => { logs.length = 0; byId('mqttLog').textContent = 'No messages yet.'; };
+  byId('mqttSimulator').onsubmit = event => {
+    event.preventDefault();
+    const result = byId('mqttSimulationStatus');
+    try {
+      const {root,filters} = readSettings();
+      const suffix = byId('mqttTopic').value.trim();
+      if (!suffix || /[+#\u0000]/.test(suffix)) throw Error('Enter a concrete topic without wildcards.');
+      const topic = suffix === kinectTopic ? suffix : fullTopic(root,suffix);
+      if (!subscriptionTopics(root,filters).some(filter => matchesTopic(filter,topic))) {
+        throw Error('This topic does not match any filter in the panel.');
+      }
+      receive('SIMULATED',topic,byId('mqttPayload').value);
+      result.textContent = 'Simulated receipt on ' + topic;
+    } catch (error) { result.textContent = error.message; }
+  };
+  return load;
+}
+
+function runPalette() {
+  byId('palette').hidden = false;
+  let project = initial();
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) project = readProject(JSON.parse(saved));
+  } catch {
+    byId('notice').textContent = 'Local storage could not be read. You can export the project as JSON.';
+  }
+  let output = null, ready = false, mode = 'setup', grid = true, draw = null, selected = null;
+  const area = () => project.areas.find(item => item.id === selected);
+  const notice = message => { byId('notice').textContent = message; };
+  const pressed = (id,on) => byId(id).setAttribute('aria-pressed',String(on));
+  let position = null;
+  const sync = () => send(output,'state',{areas:project.areas,mode,grid,draw,selected,aspect:project.aspect || 'auto',position});
+
+  window.addEventListener('projection-mapping:message',({detail}) => {
+    if (detail.topic !== kinectTopic) return;
+    const next = kinectPosition(detail.payload);
+    if (next === null || next === position) return;
+    position = next;
+    if (ready) send(output,'kinectPosition',position);
+  });
+
+  function save() {
+    try { localStorage.setItem(storageKey,JSON.stringify(project)); }
+    catch { notice('Local storage is unavailable. Export the project as JSON.'); }
+  }
+
+  const loadMqtt = setupMqtt(settings => { project.mqtt = settings; save(); });
+  loadMqtt(project.mqtt || mqttDefaults);
+
+  function refresh() {
+    pressed('setup',mode === 'setup');
+    pressed('live',mode === 'live');
+    pressed('grid',grid);
+    byId('aspect').value = project.aspect || 'auto';
+    byId('cancel').disabled = !draw;
+    byId('connection').textContent = ready ? 'Projection window open.' : 'Projection window closed.';
+    byId('open').textContent = ready ? 'Focus Projection Window' : 'Open Projection Window';
+    document.querySelectorAll('[data-shape]').forEach(button => {
+      button.disabled = !ready || mode !== 'setup';
+      button.setAttribute('aria-pressed',String(draw?.shape === button.dataset.shape));
+    });
+    const list = byId('areas');
+    list.replaceChildren();
+    if (!project.areas.length) list.textContent = 'No areas yet.';
+    for (const item of ordered(project.areas).reverse()) {
+      const button = document.createElement('button');
+      button.className = 'area';
+      button.setAttribute('aria-pressed',String(item.id === selected));
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      dot.style.background = item.color;
+      button.append(dot, document.createTextNode(item.name || shapeName[item.shape]));
+      button.onclick = () => { selected = item.id; refresh(); };
+      list.append(button);
+    }
+    const current = area();
+    byId('properties').hidden = !current;
+    byId('emptyProperties').hidden = Boolean(current);
+    byId('redraw').disabled = !ready || mode !== 'setup';
+    if (current) {
+      for (const field of ['name','color','z']) byId(field).value = current[field];
+      byId('alpha').value = Math.round(current.alpha * 100);
+      byId('alphaValue').value = byId('alpha').value + '%';
+    }
+    sync();
+  }
+
+  function startDraw(shape,target = null) {
+    if (!ready) return;
+    mode = 'setup';
+    draw = {shape,target,token:Math.random().toString(36).slice(2)};
+    notice(instructions[shape]);
+    refresh();
+  }
+
+  listen(() => output,(type,payload) => {
+    if (type === 'ready') {
+      ready = true;
+      notice('Choose a shape or press 1 or 2, then click in the projection window.');
+      refresh();
+    }
+    if (type === 'command') applyCommand(payload);
+    if (type === 'select' && mode === 'setup' && !draw) {
+      selected = project.areas.find(item => item.id === payload)?.id ?? null;
+      refresh();
+    }
+    if (type === 'edit' && mode === 'setup' && !draw) {
+      const item = project.areas.find(area => area.id === payload?.id);
+      const points = payload?.points;
+      const shape = item?.shape === 'quad' ? 'quad' : 'round';
+      if (!item || !validPoints(shape,points)) return;
+      item.shape = shape;
+      item.points = points;
+      selected = item.id;
+      notice('Area updated.');
+      save();
+      refresh();
+    }
+    if (type === 'notice') notice(payload);
+    if (type === 'progress' && draw?.token === payload?.token) {
+      notice(instructions[draw.shape] + ' ' + payload.count + '/' + pointCount(draw.shape));
+    }
+    if (type !== 'geometry' || !draw || payload?.token !== draw.token) return;
+    const {points} = payload;
+    if (!validPoints(draw.shape,points)) return;
+    const existing = project.areas.find(item => item.id === draw.target);
+    if (existing) {
+      existing.shape = draw.shape;
+      existing.points = points;
+      selected = existing.id;
+    } else {
+      selected = globalThis.crypto?.randomUUID?.() ?? draw.token;
+      project.areas.push({
+        id:selected, shape:draw.shape, points,
+        name:'Area ' + (project.areas.length + 1),
+        color:materials[project.areas.length % materials.length],
+        z:Math.min(9999,Math.max(-1,...project.areas.map(item => item.z)) + 1),alpha:1
+      });
+    }
+    draw = null;
+    notice('Area saved.');
+    save();
+    refresh();
+  });
+
+  byId('open').onclick = () => {
+    if (output && !output.closed) { output.focus(); return; }
+    const url = new URL(location.href);
+    url.hash = projectionHash;
+    output = window.open(url.href,'_blank','popup,width=960,height=540');
+    notice(output ? 'Opening projection window…' : 'Allow pop-ups to open the projection window.');
+  };
+  setInterval(() => {
+    if (output?.closed) {
+      output = null;
+      ready = false;
+      draw = null;
+      notice('Projection window closed.');
+      refresh();
+    }
+  },500);
+
+  function applyCommand(command) {
+    if (Object.hasOwn(instructions, command)) {
+      startDraw(command);
+      return;
+    }
+    if (command === 'cancel') {
+      if (!draw) return;
+      draw = null;
+      notice('Drawing canceled.');
+    } else if (command === 'setup' || command === 'live') {
+      mode = command;
+      draw = null;
+      notice(mode === 'setup' ? 'Choose a shape to draw an area.' : 'Play mode is active.');
+    } else {
+      return;
+    }
+    refresh();
+  }
+  for (const id of ['setup','live','cancel']) byId(id).onclick = () => applyCommand(id);
+  addEventListener('keydown',event => {
+    const command = shortcuts[shortcutKey(event)];
+    if (!command) return;
+    event.preventDefault();
+    applyCommand(command);
+  });
+  byId('aspect').onchange = event => {
+    project.aspect = event.target.value;
+    if (draw) {
+      draw = null;
+      notice('Projection format changed. Choose a shape to start drawing again.');
+    }
+    save();
+    refresh();
+  };
+  byId('grid').onclick = () => { grid = !grid; refresh(); };
+  document.querySelectorAll('[data-shape]').forEach(button => {
+    button.onclick = () => startDraw(button.dataset.shape);
+  });
+  byId('redraw').onclick = () => { if (area()) startDraw(area().shape === 'quad' ? 'quad' : 'round',selected); };
+  byId('remove').onclick = () => {
+    if (!area() || !confirm('Eliminare questa area?')) return;
+    project.areas = project.areas.filter(item => item.id !== selected);
+    if (draw?.target === selected) draw = null;
+    selected = null;
+    save();
+    refresh();
+  };
+  byId('name').onchange = event => { area().name = event.target.value.trim(); save(); refresh(); };
+  byId('z').onchange = event => {
+    const value = event.target.valueAsNumber;
+    if (Number.isFinite(value)) area().z = Math.max(-9999,Math.min(9999,Math.round(value)));
+    save();
+    refresh();
+  };
+  byId('color').oninput = event => { area().color = event.target.value; sync(); save(); };
+  byId('color').onchange = refresh;
+  byId('alpha').oninput = event => {
+    area().alpha = Number(event.target.value)/100;
+    byId('alphaValue').value = event.target.value + '%';
+    sync();
+    save();
+  };
+  byId('export').onclick = () => {
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([JSON.stringify(project,null,2)],{type:'application/json'}));
+    link.download = 'projection-map.json';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href),1000);
+  };
+  byId('import').onclick = () => byId('file').click();
+  byId('file').onchange = async event => {
+    const file = event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    let incoming;
+    try { incoming = readProject(JSON.parse(await file.text())); }
+    catch { notice('Import failed. Choose a JSON file exported from Projection Mapping.'); return; }
+    if (project.areas.length && !confirm('Replace the current map with the imported map?')) return;
+    project = incoming;
+    loadMqtt(project.mqtt || mqttDefaults);
+    selected = null;
+    draw = null;
+    notice('Map imported.');
+    save();
+    refresh();
+  };
+  refresh();
+}
+
+function projectionTransform(positions) {
+  // Homography from a unit square to the four clicked corners.
+  const [[x0,y0],[x1,y1],[x2,y2],[x3,y3]] = positions;
+  const dx1 = x1-x2, dx2 = x3-x2, dy1 = y1-y2, dy2 = y3-y2;
+  const sx = x0-x1+x2-x3, sy = y0-y1+y2-y3;
+  const determinant = dx1*dy2-dx2*dy1;
+  const g = (sx*dy2-dx2*sy)/determinant;
+  const h = (dx1*sy-sx*dy1)/determinant;
+  return (u,v) => {
+    const w = 1+g*u+h*v;
+    return [(x0+((1+g)*x1-x0)*u+((1+h)*x3-x0)*v)/w,
+      (y0+((1+g)*y1-y0)*u+((1+h)*y3-y0)*v)/w];
+  };
+}
+
+function runProjection() {
+  document.title = 'Projection Window · Projection Mapping';
+  document.body.classList.add('stage');
+  byId('projection').hidden = false;
+  const canvas = byId('canvas'), ctx = canvas.getContext('2d');
+  let state = {areas:[],mode:'setup',grid:false,draw:null,selected:null};
+  let viewWidth = 1, viewHeight = 1, points = [], pointer = null;
+  let frame = fitProjection(1,1,'auto');
+  let drag = null, positionFrame = null;
+  const pixels = ([x,y]) => [x*frame.width,y*frame.height];
+
+  function drawPath(shape,positions) {
+    const [a,b] = positions;
+    ctx.beginPath();
+    if (shape === 'quad') {
+      ctx.moveTo(...a);
+      for (const position of positions.slice(1)) ctx.lineTo(...position);
+      ctx.closePath();
+    } else if (shape === 'round') {
+      const map = projectionTransform(positions);
+      ctx.moveTo(...map(1,.5));
+      for (let index = 1; index < 96; index++) {
+        const angle = index * Math.PI / 48;
+        ctx.lineTo(...map(.5+.5*Math.cos(angle),.5+.5*Math.sin(angle)));
+      }
+      ctx.closePath();
+    } else if (shape === 'ellipse') {
+      ctx.ellipse((a[0]+b[0])/2,(a[1]+b[1])/2,Math.abs(a[0]-b[0])/2,Math.abs(a[1]-b[1])/2,0,0,Math.PI*2);
+    } else {
+      ctx.arc(...a,Math.hypot(a[0]-b[0],a[1]-b[1]),0,Math.PI*2);
+    }
+  }
+
+  // Each surface has its own clip and opacity. Replace the solid fill here
+  // to render a surface-specific texture, animation, or Three.js canvas.
+  function paintArea(area) {
+    ctx.save();
+    const positions = area.points.map(pixels);
+    drawPath(area.shape,positions);
+    ctx.clip();
+    ctx.globalAlpha = area.alpha;
+    ctx.fillStyle = area.color;
+    ctx.fillRect(0,0,frame.width,frame.height);
+    if (area.name === 'Area 2' && state.position != null) {
+      paintKinectBall(area.shape,positions,state.position);
+    }
+    ctx.restore();
+  }
+
+  function paintKinectBall(shape,positions,position) {
+    const [a,b] = positions;
+    let map;
+    if (positions.length === 4) {
+      map = projectionTransform(positions);
+    } else if (shape === 'ellipse') {
+      map = (u,v) => [Math.min(a[0],b[0])+u*Math.abs(a[0]-b[0]),
+        Math.min(a[1],b[1])+v*Math.abs(a[1]-b[1])];
+    } else {
+      const radius = Math.hypot(a[0]-b[0],a[1]-b[1]);
+      map = (u,v) => [a[0]+(2*u-1)*radius,a[1]+(2*v-1)*radius];
+    }
+    const u = .1 + .8 * position;
+    const [x,y] = map(u,.5);
+    const radius = Math.min(10,...[[u-.06,.5],[u+.06,.5],[u,.44],[u,.56]].map(([s,t]) => {
+      const [px,py] = map(s,t);
+      return Math.hypot(px-x,py-y);
+    }));
+    ctx.beginPath();
+    ctx.arc(x,y,radius,0,Math.PI*2);
+    ctx.fillStyle = '#ff0000';
+    ctx.fill();
+  }
+
+  function paintAreaGrid(shape,positions) {
+    ctx.save();
+    drawPath(shape,positions);
+    ctx.clip();
+    let map;
+    if (shape === 'quad' || shape === 'round') {
+      map = projectionTransform(positions);
+    } else {
+      const [[x0,y0],[x1,y1]] = positions;
+      const radius = Math.hypot(x1-x0,y1-y0);
+      map = shape === 'circle'
+        ? (u,v) => [x0+(2*u-1)*radius,y0+(2*v-1)*radius]
+        : (u,v) => [x0+(x1-x0)*u,y0+(y1-y0)*v];
+    }
+    ctx.beginPath();
+    for (let index=1; index<8; index++) {
+      const step = index/8;
+      ctx.moveTo(...map(step,0));
+      ctx.lineTo(...map(step,1));
+      ctx.moveTo(...map(0,step));
+      ctx.lineTo(...map(1,step));
+    }
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,.65)';
+    ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,.85)';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function handles(area) {
+    if (area.points.length === 4) return area.points;
+    const [[x,y],[bx,by]] = area.points;
+    let left = Math.min(x,bx), right = Math.max(x,bx);
+    let top = Math.min(y,by), bottom = Math.max(y,by);
+    if (area.shape === 'circle') {
+      const radius = Math.hypot((bx-x)*frame.width,(by-y)*frame.height);
+      left = x-radius/frame.width;
+      right = x+radius/frame.width;
+      top = y-radius/frame.height;
+      bottom = y+radius/frame.height;
+    }
+    return [[left,top],[right,top],[right,bottom],[left,bottom]];
+  }
+
+  function paintHandles(area) {
+    const corners = handles(area).map(pixels);
+    drawPath('quad',corners);
+    ctx.strokeStyle = '#baff72';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5,4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    for (const [x,y] of corners) {
+      ctx.fillStyle = '#baff72';
+      ctx.fillRect(x-5,y-5,10,10);
+      ctx.strokeStyle = '#000';
+      ctx.strokeRect(x-5,y-5,10,10);
+    }
+  }
+
+  function paint() {
+    const setup = state.mode === 'setup';
+    const {width,height,left,top} = frame;
+    ctx.clearRect(0,0,viewWidth,viewHeight);
+    ctx.save();
+    ctx.translate(left,top);
+    ctx.beginPath();
+    ctx.rect(0,0,width,height);
+    ctx.clip();
+    if (setup && state.grid) {
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = '#394650';
+      ctx.beginPath();
+      for (let index=1; index<10; index++) {
+        ctx.moveTo(index*width/10,0);
+        ctx.lineTo(index*width/10,height);
+        ctx.moveTo(0,index*height/10);
+        ctx.lineTo(width,index*height/10);
+      }
+      ctx.stroke();
+    }
+    const areas = ordered(state.areas).map(area => drag?.preview?.id === area.id ? drag.preview : area);
+    for (const area of areas) paintArea(area);
+    if (setup) {
+      for (const area of areas) {
+        const positions = area.points.map(pixels);
+        if (state.grid) paintAreaGrid(area.shape,positions);
+        drawPath(area.shape,positions);
+        ctx.lineWidth = area.id === state.selected ? 3 : 1;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+        const [x,y] = positions[0];
+        ctx.font = '14px system-ui';
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#000';
+        ctx.strokeText(area.name,x+8,y+18);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(area.name,x+8,y+18);
+      }
+      if (state.draw && points.length) {
+        const shape = state.draw.shape;
+        const positions = (pointer ? [...points,pointer] : points).map(pixels);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6,5]);
+        if (positions.length === 4 && validGeometry(shape,positions)) {
+          drawPath(shape,positions);
+          ctx.stroke();
+        }
+        drawPath('quad',positions);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (const point of points.map(pixels)) {
+          ctx.beginPath();
+          ctx.arc(...point,4,0,Math.PI*2);
+          ctx.fillStyle = '#baff72';
+          ctx.fill();
+        }
+      }
+    }
+    if (setup) {
+      const selected = areas.find(area => area.id === (drag?.id ?? state.selected));
+      if (selected && !state.draw) paintHandles(selected);
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(0,0,width,height);
+    }
+    ctx.restore();
+    canvas.style.cursor = setup ? (state.draw ? 'crosshair' : drag ? 'grabbing' : 'default') : 'none';
+  }
+
+  function resize() {
+    viewWidth = Math.max(1,canvas.clientWidth);
+    viewHeight = Math.max(1,canvas.clientHeight);
+    frame = fitProjection(viewWidth,viewHeight,state.aspect);
+    pointer = null;
+    const density = devicePixelRatio || 1;
+    canvas.width = Math.round(viewWidth*density);
+    canvas.height = Math.round(viewHeight*density);
+    ctx.setTransform(canvas.width/viewWidth,0,0,canvas.height/viewHeight,0,0);
+    paint();
+  }
+
+  function normalized(event) {
+    const x = (event.clientX-frame.left)/frame.width;
+    const y = (event.clientY-frame.top)/frame.height;
+    return isUnit(x) && isUnit(y) ? [x,y] : null;
+  }
+  canvas.onpointerdown = event => {
+    if (state.mode !== 'setup' || state.draw || drag || event.button !== 0) return;
+    const position = normalized(event);
+    if (!position) return;
+    const selected = state.areas.find(area => area.id === state.selected);
+    const [px,py] = pixels(position);
+    const corner = selected ? handles(selected).findIndex(point => {
+      const [x,y] = pixels(point);
+      return Math.hypot(x-px,y-py) <= 12;
+    }) : -1;
+    const area = corner >= 0 ? selected : ordered(state.areas).reverse().find(item => {
+      drawPath(item.shape,item.points.map(pixels));
+      return ctx.isPointInPath(px*canvas.width/viewWidth,py*canvas.height/viewHeight);
+    });
+    send(window.opener,'select',area?.id);
+    if (!area) return;
+    const original = handles(area).map(point => point.map(value => Math.max(0,Math.min(1,value))));
+    drag = {id:area.id,pointerId:event.pointerId,position,corner,original,
+      shape:area.shape === 'quad' ? 'quad' : 'round',preview:null};
+    canvas.setPointerCapture(event.pointerId);
+    paint();
+  };
+
+  canvas.onpointermove = event => {
+    if (state.draw) { pointer = normalized(event); paint(); return; }
+    if (drag?.pointerId !== event.pointerId) return;
+    const x = (event.clientX-frame.left)/frame.width;
+    const y = (event.clientY-frame.top)/frame.height;
+    const {original,corner,position,shape,id} = drag;
+    const move = (value,axis) => {
+      const values = original.map(point => point[axis]);
+      return Math.max(-Math.min(...values),Math.min(1-Math.max(...values),value-position[axis]));
+    };
+    const dx = move(x,0), dy = move(y,1);
+    const clamp = value => Math.max(0,Math.min(1,value));
+    const points = corner < 0 ? original.map(([a,b]) => [clamp(a+dx),clamp(b+dy)])
+      : original.map((point,index) => index === corner ? [clamp(x),clamp(y)] : point);
+    if (validPoints(shape,points) && (drag.preview || Math.hypot((x-position[0])*frame.width,(y-position[1])*frame.height) >= 2)) {
+      drag.preview = {...state.areas.find(area => area.id === id),shape,points};
+      paint();
+    }
+  };
+
+  canvas.onpointerup = event => {
+    if (drag?.pointerId !== event.pointerId) return;
+    if (drag.preview) send(window.opener,'edit',{id:drag.id,points:drag.preview.points});
+    drag = null;
+    paint();
+  };
+  canvas.onlostpointercapture = event => {
+    if (drag?.pointerId !== event.pointerId) return;
+    drag = null;
+    paint();
+  };
+  canvas.onpointerleave = () => { pointer = null; paint(); };
+  canvas.onclick = event => {
+    if (state.mode !== 'setup' || !state.draw) return;
+    const position = normalized(event);
+    if (!position) return;
+    points.push(position);
+    if (points.length === pointCount(state.draw.shape)) {
+      if (validGeometry(state.draw.shape,points)) {
+        send(window.opener,'geometry',{token:state.draw.token,points});
+        state.draw = null;
+      } else {
+        send(window.opener,'notice','Invalid shape. Start again at the first point.');
+      }
+      points = [];
+      pointer = null;
+    } else {
+      send(window.opener,'progress',{token:state.draw.token,count:points.length});
+    }
+    paint();
+  };
+  async function fullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
+      else await document.documentElement.webkitRequestFullscreen();
+    } catch {
+      send(window.opener,'notice','Use the browser’s fullscreen command.');
+    }
+  }
+  addEventListener('keydown',event => {
+    const key = shortcutKey(event);
+    if (key === 'escape' && drag) {
+      drag = null;
+      paint();
+    } else if (key === 'f') {
+      event.preventDefault();
+      fullscreen();
+    } else if (shortcuts[key]) {
+      if (key !== 'escape') event.preventDefault();
+      send(window.opener,'command',shortcuts[key]);
+    }
+  });
+  listen(() => window.opener,(type,next) => {
+    if (type === 'kinectPosition') {
+      state.position = next;
+      positionFrame ??= requestAnimationFrame(() => {
+        positionFrame = null;
+        paint();
+      });
+      return;
+    }
+    if (type !== 'state') return;
+    if (state.draw?.token !== next.draw?.token) { points = []; pointer = null; }
+    if (next.mode !== 'setup' || next.draw || next.aspect !== state.aspect ||
+        (drag && !next.areas.some(area => area.id === drag.id))) drag = null;
+    state = next;
+    frame = fitProjection(viewWidth,viewHeight,state.aspect);
+    paint();
+  });
+  addEventListener('resize',resize);
+  document.addEventListener('fullscreenchange',resize);
+  resize();
+  send(window.opener,'ready');
+}
+
+if (isProjection) runProjection();
+else runPalette();
+</script>
+</body>
+</html>
