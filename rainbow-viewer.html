@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MQTT Rainbow Viewer</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; overflow: hidden; background: #000; color: #eee; font: 14px system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  #palette { position: absolute; inset: 0 0 0; display: flex; }
+  #palette span { flex: 1; }
+  .circle { position: absolute; width: clamp(24px, 7vmin, 84px); aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%); border: 2px solid #fff; box-shadow: 0 0 0 1px #000; }
+  #controls { position: fixed; inset: 16px 16px auto; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; padding: 10px 12px; background: #151515; border: 1px solid #444; border-radius: 9px; width: fit-content; max-width: calc(100% - 32px); }
+  #controls[hidden] { display: none; }
+  #status { color: #bbb; overflow-wrap: anywhere; }
+  button { color: inherit; background: #252525; border: 1px solid #666; border-radius: 5px; padding: 6px 10px; cursor: pointer; }
+  .clean { cursor: none; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
+</head>
+<body>
+<div id="stage" aria-label="Live circle visualization"><div id="palette" aria-label="Rainbow color strip"></div></div>
+<div id="controls">
+  <span id="status" role="status">Connecting to MQTT…</span>
+  <button id="test">Test colors</button>
+  <button id="full">Fullscreen</button>
+  <span>Payload <code>0.25 0.70</code> (x y) · Move into the strip to pick a color · H toggles controls</span>
+</div>
+<script>
+const broker = 'wss://mqtt.marcobrianza.it:8084/mqtt';
+const subscription = 'naba/position/+';
+const timeout = 30_000;
+const stage = document.getElementById('stage');
+const controls = document.getElementById('controls');
+const status = document.getElementById('status');
+const circles = new Map();
+const paletteStart = 0.88;
+const rainbow = ['#ff3247', '#ff8c24', '#ffe33b', '#39db74', '#35dfff', '#486dff', '#b654ff'];
+const palette = document.getElementById('palette');
+palette.style.top = (paletteStart * 100) + '%';
+for (const color of rainbow) {
+  const swatch = document.createElement('span');
+  swatch.style.backgroundColor = color;
+  palette.append(swatch);
+}
+const colors = new Map();
+const firstHue = Math.random() * 360;
+let connection = 'Connecting to MQTT…';
+let received = 0;
+let lastMessage = '';
+
+function updateStatus() {
+  status.textContent = [connection, circles.size + ' active circles', received + ' received', lastMessage]
+    .filter(Boolean).join(' · ');
+}
+
+function parsePosition(raw) {
+  const coordinates = raw.trim().split(/\s+/);
+  if (coordinates.length !== 2) return null;
+  if (!coordinates.every(value => /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))) return null;
+
+  const [x, y] = coordinates.map(Number);
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? [x, y] : null;
+}
+
+function draw(id, [x, y]) {
+  if (!colors.has(id)) {
+    const hue = (firstHue + colors.size * 137.507764) % 360;
+    colors.set(id, 'hsl(' + hue + ' 92% 64%)');
+  }
+  if (y >= paletteStart) {
+    const index = Math.min(rainbow.length - 1, Math.floor(x * rainbow.length));
+    colors.set(id, rainbow[index]);
+  }
+
+  let circle = circles.get(id);
+  if (!circle) {
+    const element = document.createElement('div');
+    element.className = 'circle';
+    stage.append(element);
+    circle = { element };
+    circles.set(id, circle);
+  }
+
+  circle.element.style.left = (x * 100) + '%';
+  circle.element.style.top = (y * 100) + '%';
+  circle.element.style.backgroundColor = colors.get(id);
+  clearTimeout(circle.timer);
+  circle.timer = setTimeout(() => {
+    circle.element.remove();
+    circles.delete(id);
+    updateStatus();
+  }, timeout);
+}
+
+function receive(topic, payload) {
+  if (!/^naba\/position\/\d+$/.test(topic)) return;
+  received++;
+  const position = parsePosition(payload.toString());
+  lastMessage = topic + (position ? ' ' + position.join(' ') : ' · invalid position');
+  if (position) draw(topic, position);
+  updateStatus();
+}
+
+function showControls(show) {
+  controls.hidden = !show;
+  document.body.classList.toggle('clean', !show);
+}
+
+const fullscreen = document.getElementById('full');
+fullscreen.addEventListener('click', async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+  } catch {
+    status.textContent = 'Use your browser’s fullscreen command, then press H to hide controls.';
+  }
+});
+document.addEventListener('fullscreenchange', () => showControls(!document.fullscreenElement));
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() === 'h' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    showControls(controls.hidden);
+  }
+});
+let demoInPalette = false;
+document.getElementById('test').addEventListener('click', () => {
+  demoInPalette = !demoInPalette;
+  draw('demo/1', demoInPalette ? [0.07, 0.94] : [0.47, 0.50]);
+  draw('demo/2', demoInPalette ? [0.50, 0.94] : [0.50, 0.50]);
+  draw('demo/3', demoInPalette ? [0.79, 0.94] : [0.53, 0.50]);
+  updateStatus();
+});
+
+if (window.mqtt) {
+  const client = mqtt.connect(broker, {
+    protocolVersion: 4,
+    reconnectPeriod: 2500,
+    connectTimeout: 8000,
+    resubscribe: false
+  });
+  client.on('message', receive);
+  client.on('connect', () => {
+    client.subscribe(subscription, (error, grants) => {
+      connection = error || !grants?.length || grants[0].qos >= 128
+        ? 'Subscription failed' : 'Listening on ' + subscription;
+      updateStatus();
+    });
+  });
+  client.on('close', () => { connection = 'MQTT offline · retrying'; updateStatus(); });
+  client.on('error', () => { connection = 'MQTT connection error · retrying'; updateStatus(); });
+} else {
+  connection = 'MQTT client could not load · check internet access and reload';
+}
+updateStatus();
+</script>
+</body>
+</html>
