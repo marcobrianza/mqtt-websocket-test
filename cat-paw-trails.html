@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cat Paw Trails</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; overflow: hidden; background: #000; color: #eee; font: 14px system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  #trails, #paws { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #palette { position: absolute; inset: 0 0 0; display: flex; }
+  #palette span { flex: 1; }
+  .circle { position: absolute; width: clamp(24px, 7vmin, 84px); aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%); border: 2px solid #fff; box-shadow: 0 0 0 1px #000; }
+  #controls { position: fixed; inset: 16px 16px auto; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; padding: 10px 12px; background: #151515; border: 1px solid #444; border-radius: 9px; width: fit-content; max-width: calc(100% - 32px); }
+  #controls[hidden] { display: none; }
+  #status { color: #bbb; overflow-wrap: anywhere; }
+  button { color: inherit; background: #252525; border: 1px solid #666; border-radius: 5px; padding: 6px 10px; cursor: pointer; }
+  .clean { cursor: none; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
+</head>
+<body>
+<div id="stage" aria-label="Live circle visualization"><canvas id="trails" aria-hidden="true"></canvas><canvas id="paws" aria-hidden="true"></canvas><div id="palette" aria-label="Rainbow color strip"></div></div>
+<div id="controls">
+  <span id="status" role="status">Connecting to MQTT…</span>
+  <button id="test">Test colors</button>
+  <label>Trail <select id="trail-mode"><option value="paws">Cat paws</option><option value="line">Line</option></select></label>
+  <button id="clear">Clear trails</button>
+  <button id="full">Fullscreen</button>
+  <span>Payload <code>0.25 0.70</code> (x y) · Move into the strip to pick a color · H toggles controls</span>
+</div>
+<script>
+const broker = 'wss://mqtt.marcobrianza.it:8084/mqtt';
+const subscription = 'naba/position/+';
+const timeout = 30_000;
+const stage = document.getElementById('stage');
+const controls = document.getElementById('controls');
+const status = document.getElementById('status');
+const circles = new Map();
+const trails = document.getElementById('trails');
+const ink = trails.getContext('2d');
+const trailMode = document.getElementById('trail-mode');
+const pawCanvas = document.getElementById('paws');
+const pawInk = pawCanvas.getContext('2d');
+const pawPrints = new Map();
+const pawHold = 10_000;
+const pawFade = 3_000;
+let pawFrame = null;
+
+function resizeTrails() {
+  const pixelRatio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(stage.clientWidth * pixelRatio));
+  const height = Math.max(1, Math.round(stage.clientHeight * pixelRatio));
+  if (trails.width === width && trails.height === height) return;
+
+  const previous = document.createElement('canvas');
+  previous.width = trails.width;
+  previous.height = trails.height;
+  previous.getContext('2d').drawImage(trails, 0, 0);
+  const scaleX = width / previous.width;
+  const scaleY = height / previous.height;
+  for (const print of Array.from(pawPrints.values()).flat()) {
+    print.x *= scaleX;
+    print.y *= scaleY;
+    print.radius *= Math.max(scaleX, scaleY);
+  }
+  for (const circle of circles.values()) circle.stepRemaining = undefined;
+  trails.width = width;
+  trails.height = height;
+  ink.drawImage(previous, 0, 0, width, height);
+  pawCanvas.width = width;
+  pawCanvas.height = height;
+  schedulePawFrame();
+}
+
+function strokeTrail(circle, x, y, color) {
+  if (circle.x === x && circle.y === y) return;
+  ink.strokeStyle = color;
+  ink.lineWidth = Math.max(3, 0.012 * Math.min(trails.width, trails.height));
+  ink.lineCap = 'round';
+  ink.beginPath();
+  ink.moveTo(circle.x * trails.width, circle.y * trails.height);
+  ink.lineTo(x * trails.width, y * trails.height);
+  ink.stroke();
+}
+
+function stampPaw(x, y, radius, angle, color) {
+  pawInk.save();
+  pawInk.translate(x, y);
+  pawInk.rotate(angle);
+  pawInk.scale(radius, radius);
+  pawInk.fillStyle = color;
+  pawInk.beginPath();
+  pawInk.ellipse(-0.22, 0, 0.40, 0.46, 0, 0, Math.PI * 2);
+  for (const [toeX, toeY] of [[0.25, -0.58], [0.59, -0.23], [0.59, 0.23], [0.25, 0.58]]) {
+    pawInk.moveTo(toeX + 0.19, toeY);
+    pawInk.ellipse(toeX, toeY, 0.19, 0.15, 0, 0, Math.PI * 2);
+  }
+  pawInk.fill();
+  pawInk.restore();
+}
+
+function schedulePawFrame() {
+  if (pawFrame === null && pawPrints.size) pawFrame = requestAnimationFrame(renderPaws);
+}
+
+function renderPaws(now) {
+  pawFrame = null;
+  pawInk.clearRect(0, 0, pawCanvas.width, pawCanvas.height);
+  for (const [id, prints] of pawPrints) {
+    const visible = prints.filter(print => now - print.created < pawHold + pawFade);
+    if (visible.length) pawPrints.set(id, visible);
+    else pawPrints.delete(id);
+    for (const print of visible) {
+      pawInk.globalAlpha = Math.min(1, 1 - (now - print.created - pawHold) / pawFade);
+      stampPaw(print.x, print.y, print.radius, print.angle, print.color);
+    }
+  }
+  pawInk.globalAlpha = 1;
+  schedulePawFrame();
+}
+
+function leavePaws(id, circle, x, y, color) {
+  const startX = circle.x * trails.width;
+  const startY = circle.y * trails.height;
+  const dx = x * trails.width - startX;
+  const dy = y * trails.height - startY;
+  const distance = Math.hypot(dx, dy);
+  if (!distance) return;
+
+  const radius = Math.max(10 * (window.devicePixelRatio || 1), 0.024 * Math.min(trails.width, trails.height));
+  const stride = radius * 2.7;
+  const angle = Math.atan2(dy, dx);
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const created = performance.now();
+  const prints = (pawPrints.get(id) ?? []).filter(print => created - print.created < pawHold + pawFade);
+  let step = circle.stepRemaining ?? stride / 2;
+  let side = circle.pawSide ?? -1;
+  for (; step <= distance; step += stride) {
+    const printX = startX + ux * step - uy * side * radius * 0.65;
+    const printY = startY + uy * step + ux * side * radius * 0.65;
+    if (printY + radius >= trails.height * paletteStart) continue;
+    if (prints.some(print =>
+      Math.hypot(print.x - printX, print.y - printY) < print.radius + radius
+    )) continue;
+    prints.push({ x: printX, y: printY, radius, angle, color, created });
+    side = -side;
+  }
+  if (prints.length) {
+    pawPrints.set(id, prints);
+    schedulePawFrame();
+  }
+  circle.stepRemaining = step - distance;
+  circle.pawSide = side;
+}
+
+resizeTrails();
+window.addEventListener('resize', resizeTrails);
+document.getElementById('clear').addEventListener('click', () => {
+  ink.clearRect(0, 0, trails.width, trails.height);
+  pawPrints.clear();
+  pawInk.clearRect(0, 0, pawCanvas.width, pawCanvas.height);
+  for (const circle of circles.values()) {
+    circle.stepRemaining = undefined;
+    circle.pawSide = undefined;
+  }
+});
+const paletteStart = 0.88;
+const rainbow = ['#ff3247', '#ff8c24', '#ffe33b', '#39db74', '#35dfff', '#486dff', '#b654ff'];
+trailMode.addEventListener('change', () => {
+  for (const circle of circles.values()) circle.stepRemaining = undefined;
+});
+const palette = document.getElementById('palette');
+palette.style.top = (paletteStart * 100) + '%';
+for (const color of rainbow) {
+  const swatch = document.createElement('span');
+  swatch.style.backgroundColor = color;
+  palette.append(swatch);
+}
+const colors = new Map();
+const firstHue = Math.random() * 360;
+let connection = 'Connecting to MQTT…';
+let received = 0;
+let lastMessage = '';
+
+function updateStatus() {
+  status.textContent = [connection, circles.size + ' active circles', received + ' received', lastMessage]
+    .filter(Boolean).join(' · ');
+}
+
+function parsePosition(raw) {
+  const coordinates = raw.trim().split(/\s+/);
+  if (coordinates.length !== 2) return null;
+  if (!coordinates.every(value => /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))) return null;
+
+  const [x, y] = coordinates.map(Number);
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? [x, y] : null;
+}
+
+function draw(id, [x, y]) {
+  if (!colors.has(id)) {
+    const hue = (firstHue + colors.size * 137.507764) % 360;
+    colors.set(id, 'hsl(' + hue + ' 92% 64%)');
+  }
+  const previousColor = colors.get(id);
+  if (y >= paletteStart) {
+    const index = Math.min(rainbow.length - 1, Math.floor(x * rainbow.length));
+    colors.set(id, rainbow[index]);
+  }
+
+  let circle = circles.get(id);
+  if (!circle) {
+    const element = document.createElement('div');
+    element.className = 'circle';
+    stage.append(element);
+    circle = { element };
+    circles.set(id, circle);
+  } else {
+    if (trailMode.value === 'paws') leavePaws(id, circle, x, y, previousColor);
+    else strokeTrail(circle, x, y, previousColor);
+  }
+  circle.x = x;
+  circle.y = y;
+
+  circle.element.style.left = (x * 100) + '%';
+  circle.element.style.top = (y * 100) + '%';
+  circle.element.style.backgroundColor = colors.get(id);
+  clearTimeout(circle.timer);
+  circle.timer = setTimeout(() => {
+    circle.element.remove();
+    circles.delete(id);
+    updateStatus();
+  }, timeout);
+}
+
+function receive(topic, payload) {
+  if (!/^naba\/position\/\d+$/.test(topic)) return;
+  received++;
+  const position = parsePosition(payload.toString());
+  lastMessage = topic + (position ? ' ' + position.join(' ') : ' · invalid position');
+  if (position) draw(topic, position);
+  updateStatus();
+}
+
+function showControls(show) {
+  controls.hidden = !show;
+  document.body.classList.toggle('clean', !show);
+}
+
+const fullscreen = document.getElementById('full');
+fullscreen.addEventListener('click', async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+  } catch {
+    status.textContent = 'Use your browser’s fullscreen command, then press H to hide controls.';
+  }
+});
+document.addEventListener('fullscreenchange', () => showControls(!document.fullscreenElement));
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() === 'h' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    showControls(controls.hidden);
+  }
+});
+let demoInPalette = false;
+document.getElementById('test').addEventListener('click', () => {
+  demoInPalette = !demoInPalette;
+  draw('demo/1', demoInPalette ? [0.07, 0.94] : [0.47, 0.50]);
+  draw('demo/2', demoInPalette ? [0.50, 0.94] : [0.50, 0.50]);
+  draw('demo/3', demoInPalette ? [0.79, 0.94] : [0.53, 0.50]);
+  updateStatus();
+});
+
+if (window.mqtt) {
+  const client = mqtt.connect(broker, {
+    protocolVersion: 4,
+    reconnectPeriod: 2500,
+    connectTimeout: 8000,
+    resubscribe: false
+  });
+  client.on('message', receive);
+  client.on('connect', () => {
+    client.subscribe(subscription, (error, grants) => {
+      connection = error || !grants?.length || grants[0].qos >= 128
+        ? 'Subscription failed' : 'Listening on ' + subscription;
+      updateStatus();
+    });
+  });
+  client.on('close', () => { connection = 'MQTT offline · retrying'; updateStatus(); });
+  client.on('error', () => { connection = 'MQTT connection error · retrying'; updateStatus(); });
+} else {
+  connection = 'MQTT client could not load · check internet access and reload';
+}
+updateStatus();
+</script>
+</body>
+</html>
