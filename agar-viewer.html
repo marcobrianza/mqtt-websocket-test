@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agar MQTT Viewer</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; overflow: hidden; background: #000; color: #eee; font: 14px system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  .circle { position: absolute; width: var(--diameter); aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%); }
+  @property --ripple-offset {
+    syntax: '<percentage>';
+    inherits: false;
+    initial-value: 0%;
+  }
+  .circle.ripple { animation: ripple var(--ripple-period) linear infinite; }
+  @keyframes ripple { from { --ripple-offset: 0%; } to { --ripple-offset: 50%; } }
+  #controls { position: fixed; inset: auto 16px 16px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; padding: 10px 12px; background: #151515; border: 1px solid #444; border-radius: 9px; width: fit-content; max-width: calc(100% - 32px); }
+  #controls[hidden] { display: none; }
+  #status { color: #bbb; overflow-wrap: anywhere; }
+  button { color: inherit; background: #252525; border: 1px solid #666; border-radius: 5px; padding: 6px 10px; cursor: pointer; }
+  .clean { cursor: none; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
+</head>
+<body>
+<div id="stage" aria-label="Live circle visualization"></div>
+<div id="controls">
+  <span id="status" role="status">Connecting to MQTT…</span>
+  <button id="test">Test circles</button>
+  <button id="full">Fullscreen</button>
+  <span>Payload <code>0.25 0.70</code> (x y) · H toggles controls</span>
+</div>
+<script>
+const broker = 'wss://mqtt.marcobrianza.it:8084/mqtt';
+const subscription = 'naba/position/+';
+const timeout = 30_000;
+const stage = document.getElementById('stage');
+const controls = document.getElementById('controls');
+const status = document.getElementById('status');
+const circles = new Map();
+let renderedGroups = new Map();
+const colors = new Map();
+const firstHue = Math.random() * 360;
+let connection = 'Connecting to MQTT…';
+let received = 0;
+let lastMessage = '';
+let renderPending = false;
+
+function updateStatus() {
+  status.textContent = [connection, circles.size + ' active circles', received + ' received', lastMessage]
+    .filter(Boolean).join(' · ');
+}
+
+function parsePosition(raw) {
+  const coordinates = raw.trim().split(/\s+/);
+  if (coordinates.length !== 2) return null;
+  if (!coordinates.every(value => /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value))) return null;
+
+  const [x, y] = coordinates.map(Number);
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? [x, y] : null;
+}
+
+function baseDiameter(width, height) {
+  return Math.max(24, Math.min(84, Math.min(width, height) * 0.07));
+}
+
+function overlapGroups(points, diameter) {
+  const remaining = new Set(points);
+  const groups = [];
+  for (const point of remaining) {
+    const group = [point];
+    remaining.delete(point);
+    for (const member of group) {
+      for (const candidate of remaining) {
+        if (Math.hypot(member.x - candidate.x, member.y - candidate.y) <= diameter) {
+          group.push(candidate);
+          remaining.delete(candidate);
+        }
+      }
+    }
+    groups.push(group);
+  }
+  return groups;
+}
+
+function ringColors(group) {
+  const bandWidth = 50 / group.length;
+  // One palette cycle occupies half the radius. Shifting it by half the radius loops seamlessly.
+  const stops = group.map(({ color }, index) => {
+    const inner = index * bandWidth;
+    const outer = (index + 1) * bandWidth;
+    return color + ' calc(var(--ripple-offset) + ' + inner + '%)'
+      + ' calc(var(--ripple-offset) + ' + outer + '%)';
+  });
+  return 'repeating-radial-gradient(circle closest-side, ' + stops.join(', ') + ')';
+}
+
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(() => {
+    renderPending = false;
+    const { clientWidth: width, clientHeight: height } = stage;
+    const diameter = baseDiameter(width, height);
+    const points = [...circles.values()].map(circle => ({
+      x: circle.x * width,
+      y: circle.y * height,
+      color: circle.color,
+      order: circle.order
+    }));
+    const nextGroups = new Map();
+    for (const group of overlapGroups(points, diameter)) {
+      const count = group.length;
+      group.sort((a, b) => a.order - b.order);
+      const key = group.map(point => point.order).join(',');
+      let element = renderedGroups.get(key);
+      if (!element) {
+        element = document.createElement('div');
+        element.className = count === 1 ? 'circle' : 'circle ripple';
+        element.style.background = count === 1 ? group[0].color : ringColors(group);
+        element.style.setProperty('--ripple-period', (count * 450) + 'ms');
+        stage.append(element);
+      }
+      nextGroups.set(key, element);
+      element.style.left = (group.reduce((sum, point) => sum + point.x, 0) / count) + 'px';
+      element.style.top = (group.reduce((sum, point) => sum + point.y, 0) / count) + 'px';
+      const scale = count === 1 ? 1 : 3 * Math.sqrt(count / 2);
+      element.style.setProperty('--diameter', (diameter * scale) + 'px');
+    }
+    for (const [key, element] of renderedGroups) {
+      if (!nextGroups.has(key)) element.remove();
+    }
+    renderedGroups = nextGroups;
+  });
+}
+
+function draw(id, [x, y]) {
+  if (!colors.has(id)) {
+    const order = colors.size;
+    const hue = (firstHue + order * 137.507764) % 360;
+    colors.set(id, { order, color: 'hsl(' + hue + ' 92% 64%)' });
+  }
+  clearTimeout(circles.get(id)?.timer);
+  const timer = setTimeout(() => {
+    circles.delete(id);
+    scheduleRender();
+    updateStatus();
+  }, timeout);
+  circles.set(id, { x, y, timer, ...colors.get(id) });
+  scheduleRender();
+}
+
+window.addEventListener('resize', scheduleRender);
+
+function receive(topic, payload) {
+  if (!/^naba\/position\/\d+$/.test(topic)) return;
+  received++;
+  const position = parsePosition(payload.toString());
+  lastMessage = topic + (position ? ' ' + position.join(' ') : ' · invalid position');
+  if (position) draw(topic, position);
+  updateStatus();
+}
+
+function showControls(show) {
+  controls.hidden = !show;
+  document.body.classList.toggle('clean', !show);
+}
+
+const fullscreen = document.getElementById('full');
+fullscreen.addEventListener('click', async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+  } catch {
+    status.textContent = 'Use your browser’s fullscreen command, then press H to hide controls.';
+  }
+});
+document.addEventListener('fullscreenchange', () => showControls(!document.fullscreenElement));
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() === 'h' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    showControls(controls.hidden);
+  }
+});
+let demoStep = -1;
+document.getElementById('test').addEventListener('click', () => {
+  demoStep = (demoStep + 1) % 3;
+  const width = stage.clientWidth || 1;
+  const step = baseDiameter(width, stage.clientHeight) * 0.7 / width;
+  draw('demo/1', [0.5 - step, 0.5]);
+  draw('demo/2', demoStep === 0 ? [0.5, 0.25] : [0.5, 0.5]);
+  draw('demo/3', demoStep < 2 ? [0.7, 0.65] : [0.5 + step, 0.5]);
+  updateStatus();
+});
+
+if (window.mqtt) {
+  const client = mqtt.connect(broker, {
+    protocolVersion: 4,
+    reconnectPeriod: 2500,
+    connectTimeout: 8000,
+    resubscribe: false
+  });
+  client.on('message', receive);
+  client.on('connect', () => {
+    client.subscribe(subscription, (error, grants) => {
+      connection = error || !grants?.length || grants[0].qos >= 128
+        ? 'Subscription failed' : 'Listening on ' + subscription;
+      updateStatus();
+    });
+  });
+  client.on('close', () => { connection = 'MQTT offline · retrying'; updateStatus(); });
+  client.on('error', () => { connection = 'MQTT connection error · retrying'; updateStatus(); });
+} else {
+  connection = 'MQTT client could not load · check internet access and reload';
+}
+updateStatus();
+</script>
+</body>
+</html>
