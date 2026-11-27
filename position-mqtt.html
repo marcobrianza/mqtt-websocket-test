@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Position MQTT Debug</title>
+<style>
+* { box-sizing: border-box; }
+body { max-width: 1100px; margin: auto; padding: clamp(16px, 4vw, 44px); background: #101419; color: #e5edf5; font: 16px system-ui, sans-serif; }
+h1 { margin: 0 0 20px; font-size: clamp(24px, 4vw, 36px); }
+form, footer { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 16px 0; }
+label { flex: 1 1 260px; display: flex; align-items: center; gap: 8px; }
+input, button { padding: 8px 10px; border: 1px solid #586677; border-radius: 5px; background: #1a222b; color: inherit; font: inherit; }
+input { flex: 1; min-width: 0; }
+button { cursor: pointer; }
+canvas { display: block; width: 100%; height: clamp(240px, 55vh, 640px); background: #070a0e; outline: 1px solid #586677; cursor: crosshair; touch-action: none; }
+code, output { color: #81e7d5; font-family: ui-monospace, monospace; }
+</style>
+<h1>Position MQTT Debug</h1>
+<form id="connection">
+<label>Broker <input id="broker" type="url" value="wss://mqtt.marcobrianza.it:8084" required></label>
+<button id="connect">Connect</button>
+<span id="status" role="status">Disconnected</span>
+</form>
+<label>MQTT topic <input id="topic" value="naba/position/1" spellcheck="false" autocomplete="off"></label>
+<p id="topic-help">Move your pointer over the canvas to publish its coordinates.</p>
+<canvas aria-label="Position canvas. X increases rightward and Y increases downward."></canvas>
+<footer>
+<span>Position <output id="position">—</output></span>
+<span>Last sent <output id="last">—</output></span>
+</footer>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.min.js"></script>
+<script>
+'use strict';
+const topicInput = document.querySelector('#topic');
+const topicHelp = document.querySelector('#topic-help');
+const trackHelp = topicHelp.textContent;
+function validTopic(topic) {
+  return topic.length > 0 && !/[+#\u0000]/.test(topic) && new TextEncoder().encode(topic).length <= 65535;
+}
+const canvas = document.querySelector('canvas');
+const context = canvas.getContext('2d');
+const broker = document.querySelector('#broker');
+const button = document.querySelector('#connect');
+const status = document.querySelector('#status');
+const position = document.querySelector('#position');
+const last = document.querySelector('#last');
+let client = null;
+let point = null;
+let pending = null;
+
+topicInput.setAttribute('aria-describedby', 'topic-help');
+topicInput.addEventListener('input', () => {
+  pending = null;
+  const valid = validTopic(topicInput.value.trim());
+  topicInput.setAttribute('aria-invalid', String(!valid));
+  topicHelp.textContent = valid ? trackHelp : 'Enter a valid MQTT publish topic without + or #.';
+});
+
+document.querySelector('#connection').addEventListener('submit', event => {
+  event.preventDefault();
+  if (client) {
+    const previous = client;
+    client = null;
+    pending = null;
+    previous.end(true);
+    button.textContent = 'Connect';
+    status.textContent = 'Disconnected';
+    return;
+  }
+  try {
+    const url = new URL(broker.value);
+    if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('Enter a ws:// or wss:// address');
+    if (!window.mqtt) throw new Error('MQTT library failed to load');
+    const connection = window.mqtt.connect(url.href, { connectTimeout: 8000, reconnectPeriod: 2000 });
+    client = connection;
+    button.textContent = 'Disconnect';
+    status.textContent = 'Connecting…';
+    const show = message => {
+      if (client === connection) status.textContent = message;
+    };
+    connection.on('connect', () => show('Connected'));
+    connection.on('close', () => show('Offline · retrying'));
+    connection.on('error', error => show(error.message));
+  } catch (error) {
+    status.textContent = error.message;
+  }
+});
+
+function draw() {
+  const { width, height } = canvas;
+  context.clearRect(0, 0, width, height);
+  context.strokeStyle = '#25303d';
+  context.beginPath();
+  for (let quarter = 1; quarter < 4; quarter++) {
+    const x = width * quarter / 4;
+    const y = height * quarter / 4;
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.moveTo(0, y);
+    context.lineTo(width, y);
+  }
+  context.stroke();
+  if (!point) return;
+  const radius = 8 * (window.devicePixelRatio || 1);
+  const x = Math.max(radius, Math.min(width - radius, point.x * width));
+  const y = Math.max(radius, Math.min(height - radius, point.y * height));
+  context.fillStyle = '#81e7d5';
+  context.beginPath();
+  context.arc(x, y, radius, 0, 2 * Math.PI);
+  context.fill();
+}
+
+new ResizeObserver(() => {
+  const scale = window.devicePixelRatio || 1;
+  canvas.width = Math.round(canvas.clientWidth * scale);
+  canvas.height = Math.round(canvas.clientHeight * scale);
+  draw();
+}).observe(canvas);
+
+const clamp = value => Math.max(0, Math.min(1, value));
+function track(event) {
+  const bounds = canvas.getBoundingClientRect();
+  point = {
+    x: clamp((event.clientX - bounds.left) / bounds.width),
+    y: clamp((event.clientY - bounds.top) / bounds.height)
+  };
+  const payload = [point.x, point.y].map(value => value.toFixed(4)).join(' ');
+  position.textContent = payload;
+  if (client?.connected) pending = payload;
+  draw();
+}
+canvas.addEventListener('pointermove', track);
+canvas.addEventListener('pointerdown', track);
+setInterval(() => {
+  const payload = pending;
+  pending = null;
+  const topic = topicInput.value.trim();
+  if (!payload || !client?.connected || !validTopic(topic)) return;
+  const connection = client;
+  connection.publish(topic, payload, { qos: 0, retain: false }, error => {
+    if (client !== connection) return;
+    if (error) status.textContent = error.message;
+    else last.textContent = payload;
+  });
+}, 33);
+</script>
+</html>
