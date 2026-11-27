@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projection Mapping 02 · MQTT Ball Test</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#121519;color:#f0f2f4;--line:#343c45;--muted:#b0bbc6}
+*{box-sizing:border-box}
+body{margin:0}
+main{padding:16px}
+header,.bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header{justify-content:space-between;margin-bottom:12px}
+h1,h2{margin:0;font-size:1.15rem}
+button,input,textarea{font:inherit;color:inherit;background:#1b2026;border:1px solid var(--line);border-radius:6px;padding:8px}
+button{cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#stage{position:relative;height:55vh;min-height:180px;background:#000;border:1px solid var(--line);overflow:hidden;--diameter:clamp(20px,4vw,40px)}
+#stage:fullscreen{height:100%;width:100%;border:0}
+#track{position:absolute;inset:0 calc(var(--diameter) / 2 + 6px)}
+#ball{position:absolute;top:50%;left:50%;width:var(--diameter);height:var(--diameter);transform:translate(-50%,-50%);background:#ff0000;border-radius:50%}
+#position{position:absolute;top:10px;left:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+#mqttPanel{margin-top:16px}
+label{display:grid;gap:5px;color:var(--muted)}
+.cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media(max-width:600px){.cols{grid-template-columns:1fr}}
+details > summary{cursor:pointer;font-weight:650}.mqtt-form{display:grid;gap:12px;margin:14px 0}.mqtt-form label input,.mqtt-form textarea{width:100%;font-family:ui-monospace,monospace}.mqtt-form textarea{min-height:72px;resize:vertical}.mqtt-log{max-height:230px;overflow:auto;background:#121519;border:1px solid var(--line);padding:12px;white-space:pre-wrap;overflow-wrap:anywhere}.mqtt-form p{margin:0;font-size:.875rem}.mqtt-form h3{margin:0;font-size:1rem}.mqtt-actions{justify-content:space-between}#mqttStatus{color:var(--muted)}
+</style>
+<body>
+<main>
+<header><h1>Projection Mapping 02 · MQTT Ball Test</h1><button id="fullscreen">Fullscreen</button></header>
+<div id="stage" role="region" aria-label="Ball display">
+  <div id="track"><div id="ball" aria-hidden="true"></div></div>
+  <output id="position" aria-live="off">Waiting for position</output>
+</div>
+<section id="mqttPanel">
+<h2>MQTT Debug</h2>
+<pre id="mqttLog" class="mqtt-log" role="log" aria-label="Incoming MQTT messages">No messages yet.</pre>
+<form id="mqttSettings" class="mqtt-form">
+<div class="cols">
+<label>Broker WebSocket URL<input id="mqttBroker" type="url" required></label>
+<label>Topic root<input id="mqttRoot" placeholder="naba/test01"></label>
+</div>
+<label>Subscription filters, one per line<textarea id="mqttFilters" spellcheck="false" required></textarea></label>
+<p>Filters are relative to the topic root. The app also subscribes to naba/kinect/fatcat/position.</p>
+<div class="bar"><button id="mqttApply" type="submit">Apply &amp; Connect</button><button id="mqttDisconnect" type="button" disabled>Disconnect</button><span id="mqttStatus" role="status">Disconnected</span></div>
+</form>
+<form id="mqttSimulator" class="mqtt-form">
+<h3>Simulate an incoming message</h3>
+<div class="cols"><label>Topic<input id="mqttTopic" required value="naba/kinect/fatcat/position"></label><label>Payload<input id="mqttPayload" value="0.5"></label></div>
+<div class="bar mqtt-actions"><button type="submit">Simulate Receive</button><button id="mqttClear" type="button">Clear Log</button></div>
+<p id="mqttSimulationStatus" role="status">Enter a value from 0 to 1 to move the ball without a broker connection.</p>
+</form>
+</section>
+
+</main>
+<script>
+'use strict';
+const byId = id => document.getElementById(id);
+const kinectTopic = 'naba/kinect/fatcat/position';
+const mqttDefaults = {broker:'wss://mqtt.marcobrianza.it:8084/mqtt', root:'naba/test01', filters:['a','b','c']};
+
+function mqttConfig(broker,root,filters) {
+  const url = new URL(broker);
+  if (!['ws:','wss:'].includes(url.protocol) || url.username || url.password || url.hash) {
+    throw Error('Enter a ws:// or wss:// broker URL without credentials or a fragment.');
+  }
+  if (/[+#\u0000]/.test(root)) throw Error('The topic root must not contain wildcards.');
+  if (!filters.length || filters.some(filter => {
+    const levels = filter.split('/');
+    return !filter || /^\$share\//.test(filter) || levels.some((level,index) =>
+      /\u0000/.test(level) || (/[+#]/.test(level) && level !== '+' &&
+        !(level === '#' && index === levels.length - 1)));
+  })) throw Error('Enter valid MQTT subscription filters, one per line.');
+  return {broker:url.href,root,filters:[...new Set(filters)]};
+}
+
+function fullTopic(root, suffix) {
+  return root ? root + '/' + suffix : suffix;
+}
+
+function matchesTopic(filter, topic) {
+  if (topic.startsWith('$') && !filter.startsWith('$')) return false;
+  const parts = topic.split('/');
+  return filter.split('/').every((level,index,array) =>
+    level === '#' || (index < parts.length && (level === '+' || level === parts[index]) &&
+      (index < array.length - 1 || parts.length === array.length)));
+}
+function subscriptionTopics(root,filters) {
+  const topics = filters.map(filter => fullTopic(root,filter));
+  if (!topics.some(filter => matchesTopic(filter,kinectTopic))) topics.push(kinectTopic);
+  return topics;
+}
+
+function kinectPosition(payload) {
+  const value = payload.trim();
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value)) return null;
+  const position = Number(value);
+  return position >= 0 && position <= 1 ? position : null;
+}
+
+function setupMqtt(saveSettings) {
+  let client = null, attempt = 0, library = null;
+  const logs = [];
+  const status = (message,active) => {
+    byId('mqttStatus').textContent = message;
+    byId('mqttDisconnect').disabled = !active;
+  };
+  function disconnect() {
+    attempt++;
+    const previous = client;
+    client = null;
+    previous?.end(true);
+    status('Disconnected',false);
+  }
+  function readSettings() {
+    return mqttConfig(byId('mqttBroker').value.trim(),
+      byId('mqttRoot').value.trim().replace(/^\/+|\/+$/g,''),
+      byId('mqttFilters').value.split('\n').map(filter => filter.trim()).filter(Boolean));
+  }
+  function load(settings) {
+    disconnect();
+    byId('mqttBroker').value = settings.broker;
+    byId('mqttRoot').value = settings.root;
+    byId('mqttFilters').value = settings.filters.join('\n');
+  }
+  function receive(source,topic,payload) {
+    const entry = {source,topic,payload};
+    const preview = payload.length > 2048 ? payload.slice(0,2048) + '…' : payload;
+    logs.push(new Date().toLocaleTimeString('en-GB') + '  ' + source + '  ' + topic + '\n' + preview);
+    if (logs.length > 60) logs.shift();
+    const log = byId('mqttLog');
+    log.textContent = logs.join('\n\n');
+    log.scrollTop = log.scrollHeight;
+    window.dispatchEvent(new CustomEvent('projection-mapping:message',{detail:entry}));
+  }
+  function loadClient() {
+    if (!library) {
+      library = new Promise((resolve,reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js';
+        script.onload = () => window.mqtt?.connect ? resolve(window.mqtt) : reject(Error('MQTT client unavailable.'));
+        script.onerror = () => { script.remove(); reject(Error('MQTT client could not be loaded.')); };
+        document.head.append(script);
+      }).catch(error => { library = null; throw error; });
+    }
+    return library;
+  }
+  byId('mqttSettings').onsubmit = async event => {
+    event.preventDefault();
+    let settings;
+    try { settings = readSettings(); }
+    catch (error) { status(error.message,Boolean(client)); return; }
+    disconnect();
+    const current = attempt;
+    saveSettings(settings);
+    status('Connecting…',true);
+    try {
+      const mqtt = await loadClient();
+      if (current !== attempt) return;
+      const connection = mqtt.connect(settings.broker,{
+        protocolVersion:4, reconnectPeriod:2000, connectTimeout:10000, resubscribe:false
+      });
+      client = connection;
+      connection.on('connect',() => {
+        if (client !== connection) return;
+        status('Connected · subscribing…',true);
+        const topics = subscriptionTopics(settings.root,settings.filters);
+        connection.subscribe(topics,{qos:0},(error,granted) => {
+          if (client !== connection || !connection.connected) return;
+          const accepted = (granted || []).filter(item => item.qos <= 2).length;
+          status(error ? 'Connected · subscription failed' :
+            'Connected · ' + accepted + '/' + topics.length + ' filters accepted',true);
+        });
+      });
+      connection.on('reconnect',() => { if (client === connection) status('Reconnecting…',true); });
+      connection.on('close',() => { if (client === connection) status('Disconnected · retrying…',true); });
+      connection.on('error',error => { if (client === connection) status('MQTT error · ' + error.message,true); });
+      connection.on('message',(topic,payload) => {
+        if (client === connection) receive('MQTT',topic,payload.toString());
+      });
+    } catch (error) {
+      if (current === attempt) status(error.message,false);
+    }
+  };
+  byId('mqttDisconnect').onclick = disconnect;
+  byId('mqttClear').onclick = () => { logs.length = 0; byId('mqttLog').textContent = 'No messages yet.'; };
+  byId('mqttSimulator').onsubmit = event => {
+    event.preventDefault();
+    const result = byId('mqttSimulationStatus');
+    try {
+      const {root,filters} = readSettings();
+      const suffix = byId('mqttTopic').value.trim();
+      if (!suffix || /[+#\u0000]/.test(suffix)) throw Error('Enter a concrete topic without wildcards.');
+      const topic = suffix === kinectTopic ? suffix : fullTopic(root,suffix);
+      if (!subscriptionTopics(root,filters).some(filter => matchesTopic(filter,topic))) {
+        throw Error('This topic does not match any filter in the panel.');
+      }
+      receive('SIMULATED',topic,byId('mqttPayload').value);
+      result.textContent = 'Simulated receipt on ' + topic;
+    } catch (error) { result.textContent = error.message; }
+  };
+  return load;
+}
+
+
+const storageKey = 'naba.mqtt-ball-test.v1';
+let settings = mqttDefaults;
+try {
+  const saved = localStorage.getItem(storageKey);
+  if (saved) {
+    const {broker,root,filters} = JSON.parse(saved);
+    settings = mqttConfig(broker,root,filters);
+  }
+} catch {
+  // Use the default broker when saved settings are unavailable.
+}
+const loadMqtt = setupMqtt(settings => {
+  try { localStorage.setItem(storageKey,JSON.stringify(settings)); } catch {}
+});
+loadMqtt(settings);
+
+window.addEventListener('projection-mapping:message',({detail}) => {
+  if (detail.topic !== kinectTopic) return;
+  const position = kinectPosition(detail.payload);
+  if (position === null) return;
+  byId('ball').style.left = position * 100 + '%';
+  byId('position').textContent = 'Position ' + position;
+});
+
+const stage = byId('stage');
+const fullscreen = byId('fullscreen');
+fullscreen.hidden = !document.fullscreenEnabled;
+fullscreen.onclick = async () => {
+  try { await stage.requestFullscreen(); }
+  catch { fullscreen.textContent = 'Fullscreen unavailable'; }
+};
+</script>
+</body>
+</html>
