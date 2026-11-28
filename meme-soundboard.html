@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="it">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Meme Soundboard</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#111218;color:#f6f6fa;font:16px system-ui,sans-serif}
+main{max-width:640px;margin:auto;padding:clamp(16px,5vw,36px)}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0 22px}
+h1{font-size:clamp(24px,6vw,43px);line-height:1;margin:0;letter-spacing:-.065em}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible{outline:3px solid white;outline-offset:4px}
+#stop{border:1px solid #f68a96;border-radius:8px;color:#ffacb5;background:#3b222b;font-weight:750;padding:12px;white-space:nowrap}
+#pads{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:14px;background:#1a1c24;border:1px solid #343643;border-radius:15px}
+.pad{aspect-ratio:1;border:2px solid #ffffff48;border-radius:8px;background:var(--pad);color:#161624;box-shadow:inset 0 -7px #0003;display:flex;flex-direction:column;justify-content:space-between;align-items:flex-start;text-align:left;padding:clamp(10px,3vw,20px);overflow:hidden}
+.pad strong{font-size:clamp(16px,4vw,24px);overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
+.pad span{font-size:24px}
+.pad:hover{filter:brightness(1.09)}
+.pad:active,.pad[aria-pressed=true]{box-shadow:inset 0 0 0 4px #232336,0 0 16px var(--pad);transform:scale(.97)}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.tools button{padding:10px 13px;border:1px solid #4a4d5e;border-radius:7px;background:#242632}
+.tools button:disabled{opacity:.5;cursor:default}
+#status{min-height:1.5em;color:#ccd0dd}
+#youtube{margin-top:22px}
+#youtube h2{font-size:16px;margin:0 0 8px}
+#player,#youtube iframe{display:block;width:200px;height:200px;border:0;background:#08090c}
+#youtube-status{color:#ccd0dd;line-height:1.4}
+#youtube a{color:#ccaeff}
+#playlist-form{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+#playlist-url{width:100%;padding:8px;font:inherit;color:inherit;background:#242632;border:1px solid #4a4d5e;border-radius:7px}
+#playlist-form button{background:#242632;border:1px solid #4a4d5e;border-radius:7px;padding:8px 12px}
+</style>
+<main>
+<header><h1>Meme Soundboard</h1><button id="stop" type="button">■ Stop</button></header>
+<section id="pads" aria-label="Suoni"></section>
+<p id="status" role="status"></p>
+<div class="tools">
+<button id="add" type="button">Carica audio</button>
+<button id="save" type="button" disabled>Scarica HTML</button>
+<input id="files" type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac" multiple hidden>
+</div>
+<section id="youtube" aria-labelledby="youtube-title">
+<h2 id="youtube-title">YouTube</h2>
+<div id="youtube-screen"><div id="player"></div></div>
+<p id="youtube-status" role="status">Caricamento della playlist…</p>
+<a id="playlist-link" target="_blank" rel="noopener">Apri su YouTube</a>
+<details>
+<summary>Cambia playlist o video</summary>
+<form id="playlist-form">
+<label for="playlist-url">Link YouTube</label>
+<input id="playlist-url" required>
+<button type="submit">Carica</button>
+</form>
+</details>
+</section>
+</main>
+<script id="sound-data" type="application/json">[]</script>
+<script id="youtube-data" type="application/json">"https://www.youtube.com/playlist?list=PLCO1GylY-UB8"</script>
+<script>
+const select = id => document.getElementById(id);
+const tracks = JSON.parse(select('sound-data').textContent);
+const colors = ['#ccaeff', '#84ecd8', '#ffc477', '#ff9bbf'];
+const status = select('status');
+const pads = select('pads');
+const files = select('files');
+const add = select('add');
+const save = select('save');
+let sourceUrl = JSON.parse(select('youtube-data').textContent);
+let yt;
+let ytReady = false;
+let ytTracks = [];
+let source;
+let loadTimer;
+let playing;
+let active;
+
+function demo(title, notes) {
+  const rate = 12000;
+  const samples = notes.length * 1440 + 960;
+  const wav = new Uint8Array(44 + samples * 2);
+  const view = new DataView(wav.buffer);
+  const label = (offset, value) => wav.set(new TextEncoder().encode(value), offset);
+  label(0, 'RIFF');
+  view.setUint32(4, wav.length - 8, true);
+  label(8, 'WAVEfmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  label(36, 'data');
+  view.setUint32(40, samples * 2, true);
+  for (let i = 0; i < samples; i++) {
+    const note = notes[Math.floor(i / 1440)];
+    if (!note) break;
+    const time = (i % 1440) / rate;
+    const level = Math.min(1, time / .01) * (1 - time / .12);
+    view.setInt16(44 + i * 2, 8000 * level * Math.sin(2 * Math.PI * note * time), true);
+  }
+  return {title, src:URL.createObjectURL(new Blob([wav], {type:'audio/wav'}))};
+}
+const demos = [
+  demo('Boing', [520,270,430,310]),
+  demo('Game over', [440,370,310,220]),
+  demo('Ding!', [740,990,1240]),
+  demo('Allarme', [620,440,620,440])
+];
+
+function stop() {
+  playing?.pause();
+  if (ytReady) yt.pauseVideo();
+  playing = undefined;
+  active?.setAttribute('aria-pressed', 'false');
+  active = undefined;
+  status.textContent = tracks.length || ytTracks.length ? '' : 'Suoni di prova · Carica i tuoi file per sostituirli.';
+}
+
+function play(track, pad) {
+  stop();
+
+  active = pad;
+  pad.setAttribute('aria-pressed', 'true');
+  status.textContent = 'In riproduzione · ' + track.title;
+  if (track.videoId) {
+    if (source.playlist && typeof track.index === 'number') {
+      if (yt.getPlaylistIndex() === track.index) {
+        yt.seekTo(0, true);
+        yt.playVideo();
+      } else {
+        yt.playVideoAt(track.index);
+      }
+    } else {
+      yt.loadVideoById(track.videoId);
+    }
+    return;
+  }
+  const audio = new Audio(track.src);
+  playing = audio;
+  audio.addEventListener('ended', () => {
+    if (playing === audio) stop();
+  }, {once:true});
+  audio.play().catch(() => {
+    if (playing !== audio) return;
+    stop();
+    status.textContent = 'Impossibile riprodurre il suono. Prova un file MP3 o WAV.';
+  });
+}
+
+function render() {
+  pads.replaceChildren();
+  const available = [...ytTracks, ...tracks];
+  (available.length ? available : demos).forEach((track, i) => {
+    const pad = document.createElement('button');
+    pad.type = 'button';
+    pad.className = 'pad';
+    pad.title = track.title;
+    pad.style.setProperty('--pad', colors[i % colors.length]);
+    pad.setAttribute('aria-pressed', 'false');
+    const icon = document.createElement('span');
+    icon.textContent = '▶';
+    icon.setAttribute('aria-hidden', 'true');
+    const title = document.createElement('strong');
+    title.textContent = track.title;
+    pad.append(icon, title);
+    pad.addEventListener('click', () => play(track, pad));
+    pads.append(pad);
+  });
+  save.disabled = !tracks.length && !ytTracks.length;
+}
+
+function readAudio(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({title:file.name.replace(/\.[^.]+$/, '') || file.name, src:reader.result});
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+select('stop').addEventListener('click', stop);
+add.addEventListener('click', () => files.click());
+files.addEventListener('change', async () => {
+  const selected = [...files.files];
+  files.value = '';
+  if (!selected.length) return;
+  add.disabled = true;
+  save.disabled = true;
+  const results = await Promise.allSettled(selected.map(readAudio));
+  for (const result of results) {
+    if (result.status === 'fulfilled') tracks.push(result.value);
+  }
+  stop();
+  render();
+  add.disabled = false;
+  if (results.some(result => result.status === 'rejected')) {
+    status.textContent = 'Alcuni file non sono stati letti.';
+  }
+});
+
+save.addEventListener('click', () => {
+  const page = document.documentElement.cloneNode(true);
+  page.querySelector('#sound-data').textContent = JSON.stringify(tracks).replace(/</g, '\\u003c');
+  page.querySelector('#youtube-data').textContent = JSON.stringify(sourceUrl).replace(/</g, '\\u003c');
+  const placeholder = document.createElement('div');
+  placeholder.id = 'player';
+  page.querySelector('#youtube-screen').replaceChildren(placeholder);
+  page.querySelector('#youtube-status').textContent = 'Caricamento della playlist…';
+  page.querySelector('#pads').replaceChildren();
+  page.querySelector('#status').textContent = '';
+  const url = URL.createObjectURL(new Blob(['<!doctype html>\n', page.outerHTML], {type:'text/html;charset=utf-8'}));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'meme-soundboard.html';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+});
+
+function parseYouTube(value) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.replace(/^(www|m)\./, '');
+    if (host !== 'youtube.com' && host !== 'youtu.be') return;
+    const playlist = url.searchParams.get('list');
+    if (playlist && /^[\w-]+$/.test(playlist)) return {playlist};
+    const videoId = host === 'youtu.be' || /^\/(shorts|embed)\//.test(url.pathname)
+      ? url.pathname.split('/').filter(Boolean).at(-1) : url.searchParams.get('v');
+    if (videoId && /^[\w-]{11}$/.test(videoId)) return {videoId};
+  } catch {
+    return;
+  }
+}
+
+const ytStatus = select('youtube-status');
+const input = select('playlist-url');
+input.value = sourceUrl;
+
+function showYouTubeError(message) {
+  clearTimeout(loadTimer);
+  ytStatus.textContent = message;
+}
+
+function syncYouTubePads() {
+  const ids = source.playlist ? yt.getPlaylist() : [source.videoId];
+  if (!ids?.length) return;
+  clearTimeout(loadTimer);
+  ytStatus.textContent = '';
+  if (ids.length === ytTracks.length && ids.every((id, i) => ytTracks[i].videoId === id)) return;
+  ytTracks = ids.map((videoId, index) => ({
+    videoId,
+    index,
+    title: source.playlist ? 'Suono ' + (index + 1) : 'Suono YouTube'
+  }));
+  render();
+  if (!playing && !active) status.textContent = '';
+}
+
+function loadSource() {
+  clearTimeout(loadTimer);
+  select('playlist-link').href = sourceUrl;
+  if (!ytReady) return;
+  if (source.playlist) yt.cuePlaylist({list:source.playlist, listType:'playlist'});
+  else yt.cueVideoById(source.videoId);
+  ytStatus.textContent = 'Caricamento da YouTube…';
+  loadTimer = setTimeout(() => showYouTubeError('YouTube non ha caricato i suoni. Controlla il link e la visibilità della playlist.'), 12000);
+}
+
+select('playlist-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const next = parseYouTube(input.value.trim());
+  if (!next) {
+    ytStatus.textContent = 'Incolla un link a una playlist o a un video di YouTube.';
+    return;
+  }
+  source = next;
+  sourceUrl = input.value.trim();
+  ytTracks = [];
+  stop();
+  render();
+  loadSource();
+});
+
+source = parseYouTube(sourceUrl);
+select('playlist-link').href = sourceUrl;
+window.onYouTubeIframeAPIReady = () => {
+  yt = new YT.Player('player', {
+    width:200,
+    height:200,
+    playerVars:{playsinline:1, ...(location.origin !== 'null' ? {origin:location.origin} : {})},
+    events:{
+      onReady:() => {
+        ytReady = true;
+        loadSource();
+      },
+      onStateChange:event => {
+        if ([YT.PlayerState.CUED, YT.PlayerState.PLAYING, YT.PlayerState.PAUSED].includes(event.data)) syncYouTubePads();
+        if (event.data === YT.PlayerState.ENDED && !playing) stop();
+      },
+      onError:event => {
+        showYouTubeError(event.data === 153 && location.protocol === 'file:'
+          ? 'Per riprodurre YouTube, carica questa pagina su un sito web.'
+          : 'YouTube non riesce a riprodurre questo contenuto nel riquadro. Controlla il link o aprilo su YouTube.');
+      }
+    }
+  });
+};
+const api = document.createElement('script');
+api.src = 'https://www.youtube.com/iframe_api';
+api.onerror = () => showYouTubeError('Impossibile collegarsi a YouTube.');
+loadTimer = setTimeout(() => showYouTubeError('Il lettore YouTube non si è avviato.'), 12000);
+document.head.append(api);
+stop();
+render();
+</script>
+</html>
